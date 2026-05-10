@@ -15,6 +15,10 @@ from urllib3.util.retry import Retry
 
 # ---------- Logging suppression (except file logger for debugging) ----------
 logging.getLogger().setLevel(logging.WARNING)
+
+# Ensure /data directory exists before creating log file
+os.makedirs('/data', exist_ok=True)
+
 file_handler = logging.FileHandler('/data/bot_debug.log', mode='a')
 file_handler.setLevel(logging.INFO)
 formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -1349,7 +1353,6 @@ def run_telegram_bot():
                         bal_text, bal_kb = format_balance_message(chat_id)
                         tg_send(chat_id, bal_text, bal_kb)
                     elif text == '📋 Withdraw History':
-                        # Normal user sees own history; admin also can see own if they click this (but they have Approved button)
                         history = get_withdrawal_history(user_id=chat_id)
                         if not history:
                             tg_send(chat_id, "📭 No completed withdrawals yet.")
@@ -1363,7 +1366,6 @@ def run_telegram_bot():
                                 )
                             tg_send(chat_id, "📋 <b>Withdraw History:</b>\n\n" + "\n\n".join(lines))
                     elif text == '📋 Withdraw List':
-                        # This button is removed from admin profile, but kept handler just in case
                         if not is_admin(chat_id):
                             tg_send(chat_id, "❌ Unauthorized.")
                             continue
