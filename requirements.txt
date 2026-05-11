@@ -3,3 +3,4 @@ pyotp>=2.8.0
 faker>=18.0.0
 python-dotenv>=1.0.0
 urllib3>=1.26.0
+PySocks>=1.7.1
