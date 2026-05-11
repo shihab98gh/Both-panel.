@@ -1,4 +1,4 @@
-# bot.py – Optimised Telegram SMS Bot (Multi‑Number, No Limit, Persistent Data, MNIT Fix)
+# bot.py – Optimised Telegram SMS Bot (Multi‑Number, No Limit, Persistent Data, MNIT Fix, DB-stored Proxy)
 import warnings
 warnings.filterwarnings("ignore", message=".*urllib3.*")
 warnings.filterwarnings("ignore", category=DeprecationWarning)
@@ -41,6 +41,10 @@ DEFAULT_STEX_EMAIL    = os.getenv('STEX_EMAIL')
 DEFAULT_STEX_PASSWORD = os.getenv('STEX_PASSWORD')
 DEFAULT_MNIT_EMAIL    = os.getenv('MNIT_EMAIL')
 DEFAULT_MNIT_PASSWORD = os.getenv('MNIT_PASSWORD')
+
+# Optional fallback proxy from .env (will be overridden by DB if set)
+PROXY_HTTP_ENV  = os.getenv('PROXY_HTTP')
+PROXY_HTTPS_ENV = os.getenv('PROXY_HTTPS')
 
 if not TELEGRAM_TOKEN:
     raise EnvironmentError('TELEGRAM_TOKEN required')
@@ -127,6 +131,23 @@ def set_setting(key, value):
         conn.execute('INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)', (key, str(value)))
         conn.commit()
         conn.close()
+
+# ---------- Proxy helpers (DB first, then env) ----------
+def get_proxy_dict():
+    """Return proxies dict for requests. First check DB, then environment variables."""
+    db_proxy = get_setting('proxy_url', '').strip()
+    proxies = {}
+    if db_proxy:
+        # Use the same URL for both http and https (typical for SOCKS5)
+        proxies['http'] = db_proxy
+        proxies['https'] = db_proxy
+    else:
+        # Fallback to environment variables if DB not set
+        if PROXY_HTTP_ENV:
+            proxies['http'] = PROXY_HTTP_ENV
+        if PROXY_HTTPS_ENV:
+            proxies['https'] = PROXY_HTTPS_ENV
+    return proxies
 
 # ---------- Wallet / Balance helpers ----------
 def ensure_user_exists(user_id):
@@ -425,7 +446,7 @@ def fetch_mail_content(email, mail_id):
     except Exception:
         return ""
 
-# ---------- StexSMS Class (MNIT login fixed) ----------
+# ---------- StexSMS Class (uses get_proxy_dict) ----------
 class StexSMS:
     def __init__(self, provider, email, password):
         self.provider = provider
@@ -433,6 +454,10 @@ class StexSMS:
         self.password = password
         self.base = 'https://x.mnitnetwork.com' if provider == 'mnitnetwork' else 'https://stexsms.com'
         self.use_headers = (provider == 'mnitnetwork')
+
+        # Proxy from DB (or env) – sets self.proxies dict
+        self.proxies = get_proxy_dict()
+
         self.session = self._create_session()
         self.token = None
         self.token_time = None
@@ -480,7 +505,7 @@ class StexSMS:
         headers = {'User-Agent': 'Mozilla/5.0'} if self.use_headers else None
         for attempt in range(3):
             try:
-                response = self.session.post(url, json=payload, headers=headers, timeout=15)
+                response = self.session.post(url, json=payload, headers=headers, timeout=15, proxies=self.proxies)
                 response.raise_for_status()
                 data = response.json()
                 self.token = (data.get('token') or
@@ -507,6 +532,7 @@ class StexSMS:
         self.ensure_auth()
         kwargs.setdefault('headers', self._headers())
         kwargs.setdefault('timeout', 30)
+        kwargs.setdefault('proxies', self.proxies)
         for attempt in range(2):
             try:
                 response = self.session.request(method, url, **kwargs)
@@ -622,7 +648,6 @@ def main_keyboard(user_id):
         [{'text': login_text}, {'text': '📧 Temp Mail'}],
         [{'text': '👤 My Profile'}]
     ]
-    # No admin buttons here – they are inside Profile
     return {'keyboard': keyboard, 'resize_keyboard': True}
 
 def profile_keyboard(user_id):
@@ -696,7 +721,11 @@ def withdraw_method_keyboard():
     }
 
 def edit_keyboard():
-    return {'keyboard': [[{'text': '💰 Price'}], [{'text': '⬅️ Back'}]], 'resize_keyboard': True}
+    # Added "🌐 Proxy" button
+    return {'keyboard': [
+        [{'text': '💰 Price'}, {'text': '🌐 Proxy'}],
+        [{'text': '⬅️ Back'}]
+    ], 'resize_keyboard': True}
 
 # ---------- Message formatters ----------
 def format_balance_message(user_id):
@@ -1199,13 +1228,26 @@ def run_telegram_bot():
                             tg_send(chat_id, f"❌ {err}", main_keyboard(chat_id))
                         continue
 
-                    # admin edit price flow
+                    # ---------- Admin edit menu (Price & Proxy) ----------
                     if state and state.get('step') == 'edit_menu':
                         if text == '💰 Price':
                             with states_lock:
                                 user_states[chat_id] = {'step': 'awaiting_price'}
                             cur_min = float(get_setting('min_withdrawal_bdt', '20.0'))
                             tg_send(chat_id, f"Current minimum withdrawal: {cur_min} BDT\n\nEnter new minimum amount in BDT:", cancel_keyboard())
+                            continue
+                        elif text == '🌐 Proxy':
+                            if not is_admin(chat_id):
+                                tg_send(chat_id, "❌ Unauthorized.")
+                                continue
+                            cur_proxy = get_setting('proxy_url', '')
+                            if cur_proxy:
+                                msg = f"Current proxy: <code>{escape(cur_proxy)}</code>\n\nSend new proxy URL (socks5://...) or /clear to remove."
+                            else:
+                                msg = "No proxy set.\n\nSend the new proxy URL (e.g., socks5://user:pass@host:port)."
+                            with states_lock:
+                                user_states[chat_id] = {'step': 'awaiting_proxy'}
+                            tg_send(chat_id, msg, cancel_keyboard())
                             continue
                         elif text == '⬅️ Back':
                             with states_lock: user_states.pop(chat_id, None)
@@ -1215,6 +1257,27 @@ def run_telegram_bot():
                             tg_send(chat_id, "Use the buttons.", edit_keyboard())
                             continue
 
+                    # proxy input
+                    if state and state.get('step') == 'awaiting_proxy':
+                        if text == '⬅️ Cancel' or text == '⬅️ Back':
+                            with states_lock: user_states.pop(chat_id, None)
+                            tg_send(chat_id, "Proxy change cancelled.", edit_keyboard())
+                            continue
+                        if text.strip().lower() == '/clear':
+                            set_setting('proxy_url', '')
+                            with states_lock: user_states.pop(chat_id, None)
+                            tg_send(chat_id, "✅ Proxy removed.", edit_keyboard())
+                            continue
+                        # Basic validation: must contain socks5:// or http://
+                        if not (text.startswith('socks5://') or text.startswith('http://') or text.startswith('https://')):
+                            tg_send(chat_id, "❌ Invalid proxy URL. Must start with socks5://, http:// or https://", cancel_keyboard())
+                            continue
+                        set_setting('proxy_url', text.strip())
+                        with states_lock: user_states.pop(chat_id, None)
+                        tg_send(chat_id, f"✅ Proxy updated to:\n<code>{escape(text.strip())}</code>", edit_keyboard())
+                        continue
+
+                    # price input
                     if state and state.get('step') == 'awaiting_price':
                         if text == '⬅️ Cancel' or text == '⬅️ Back':
                             with states_lock: user_states.pop(chat_id, None)
