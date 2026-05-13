@@ -1,4 +1,4 @@
-# bot.py – Optimised Telegram SMS Bot (Multi‑Number, No Limit, Persistent Data, MNIT Fix, DB-stored Proxy)
+# bot.py – Optimised Telegram SMS Bot (Range‑only, inline copy buttons, fixed 429)
 import warnings
 warnings.filterwarnings("ignore", message=".*urllib3.*")
 warnings.filterwarnings("ignore", category=DeprecationWarning)
@@ -13,19 +13,15 @@ from concurrent.futures import ThreadPoolExecutor
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-# ---------- Logging suppression (except file logger for debugging) ----------
+# ---------- Logging ----------
 logging.getLogger().setLevel(logging.WARNING)
-
-# Ensure /data directory exists before creating log file
 os.makedirs('/data', exist_ok=True)
-
 file_handler = logging.FileHandler('/data/bot_debug.log', mode='a')
 file_handler.setLevel(logging.INFO)
 formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 file_handler.setFormatter(formatter)
 root_logger = logging.getLogger()
 root_logger.addHandler(file_handler)
-
 for lname in ['urllib3', 'requests', 'faker', 'pyotp']:
     logging.getLogger(lname).setLevel(logging.WARNING)
 
@@ -42,7 +38,6 @@ DEFAULT_STEX_PASSWORD = os.getenv('STEX_PASSWORD')
 DEFAULT_MNIT_EMAIL    = os.getenv('MNIT_EMAIL')
 DEFAULT_MNIT_PASSWORD = os.getenv('MNIT_PASSWORD')
 
-# Optional fallback proxy from .env (will be overridden by DB if set)
 PROXY_HTTP_ENV  = os.getenv('PROXY_HTTP')
 PROXY_HTTPS_ENV = os.getenv('PROXY_HTTPS')
 
@@ -60,7 +55,7 @@ try:
 except Exception:
     BOT_USERNAME = None
 
-# ---------- Database with WAL ----------
+# ---------- Database (WAL) ----------
 DB_FILE = os.environ.get('DB_PATH', '/data/user_creds.db')
 db_dir = os.path.dirname(DB_FILE)
 if db_dir and not os.path.exists(db_dir):
@@ -80,6 +75,14 @@ def init_db():
                 provider  TEXT,
                 email     TEXT,
                 password  TEXT,
+                PRIMARY KEY (user_id, provider)
+            )
+        ''')
+        c.execute('''
+            CREATE TABLE IF NOT EXISTS user_ranges (
+                user_id   INTEGER,
+                provider  TEXT,
+                range_text TEXT,
                 PRIMARY KEY (user_id, provider)
             )
         ''')
@@ -121,9 +124,7 @@ def get_setting(key, default=None):
         conn = sqlite3.connect(DB_FILE)
         row = conn.execute('SELECT value FROM settings WHERE key=?', (key,)).fetchone()
         conn.close()
-        if row:
-            return row[0]
-        return default
+        return row[0] if row else default
 
 def set_setting(key, value):
     with db_lock:
@@ -132,24 +133,21 @@ def set_setting(key, value):
         conn.commit()
         conn.close()
 
-# ---------- Proxy helpers (DB first, then env) ----------
+# ---------- Proxy helpers ----------
 def get_proxy_dict():
-    """Return proxies dict for requests. First check DB, then environment variables."""
     db_proxy = get_setting('proxy_url', '').strip()
     proxies = {}
     if db_proxy:
-        # Use the same URL for both http and https (typical for SOCKS5)
         proxies['http'] = db_proxy
         proxies['https'] = db_proxy
     else:
-        # Fallback to environment variables if DB not set
         if PROXY_HTTP_ENV:
             proxies['http'] = PROXY_HTTP_ENV
         if PROXY_HTTPS_ENV:
             proxies['https'] = PROXY_HTTPS_ENV
     return proxies
 
-# ---------- Wallet / Balance helpers ----------
+# ---------- Wallet / Balance ----------
 def ensure_user_exists(user_id):
     with db_lock:
         conn = sqlite3.connect(DB_FILE)
@@ -242,7 +240,6 @@ def complete_withdrawal(request_id, admin_id):
         conn.execute('UPDATE withdraw_requests SET status="completed", completed_time=? WHERE id=?', (now, request_id))
         conn.commit()
         conn.close()
-
         ex_rate = 125.0
         if method == 'binance':
             amount_display = f"${amount/ex_rate:.4f}"
@@ -259,7 +256,6 @@ def complete_withdrawal(request_id, admin_id):
         else:
             amount_display = f"{amount:.2f} BDT"
             wallet_label = "Wallet"
-
         msg = (
             f"🎉 <b>Withdrawal Approved</b>\n\n"
             f"💵 <b>Amount:</b> {amount_display}\n"
@@ -291,6 +287,29 @@ def get_withdrawal_history(user_id=None):
 
 def is_admin(user_id):
     return user_id in ADMIN_IDS
+
+# ---------- Range helpers (DB persisted) ----------
+def save_user_range(user_id, provider, range_text):
+    with db_lock:
+        conn = sqlite3.connect(DB_FILE)
+        conn.execute('INSERT OR REPLACE INTO user_ranges (user_id, provider, range_text) VALUES (?, ?, ?)',
+                     (user_id, provider, range_text))
+        conn.commit()
+        conn.close()
+
+def get_user_range(user_id, provider):
+    with db_lock:
+        conn = sqlite3.connect(DB_FILE)
+        row = conn.execute('SELECT range_text FROM user_ranges WHERE user_id=? AND provider=?', (user_id, provider)).fetchone()
+        conn.close()
+        return row[0] if row else None
+
+def delete_user_range(user_id, provider):
+    with db_lock:
+        conn = sqlite3.connect(DB_FILE)
+        conn.execute('DELETE FROM user_ranges WHERE user_id=? AND provider=?', (user_id, provider))
+        conn.commit()
+        conn.close()
 
 # ---------- Credentials helpers ----------
 def save_credentials(user_id, provider, email, password):
@@ -326,8 +345,6 @@ instances_lock   = threading.RLock()
 user_states      = {}
 states_lock      = threading.RLock()
 user_last_request = defaultdict(float)
-user_latest_range = {}
-user_latest_provider = {}
 
 active_monitors = {}
 monitors_lock = threading.RLock()
@@ -406,9 +423,6 @@ def clean_html(raw_html):
     raw_html = unescape(raw_html)
     return re.sub(r"\n{2,}", "\n", raw_html).strip()
 
-def extract_otp_temp(text):
-    return extract_otp_universal(text)
-
 def fetch_latest_mail(email):
     encoded = email.replace("@", "%40")
     url = f"https://tempmail.plus/api/mails?email={encoded}&first_id=0&epin="
@@ -446,39 +460,34 @@ def fetch_mail_content(email, mail_id):
     except Exception:
         return ""
 
-# ---------- StexSMS Class (uses get_proxy_dict) ----------
+# ---------- StexSMS Class with per-provider rate limiter ----------
 class StexSMS:
+    _provider_locks = {'stexsms': threading.Lock(), 'mnitnetwork': threading.Lock()}
+    _last_request_time = {'stexsms': 0, 'mnitnetwork': 0}
+    _min_interval = 1.2  # seconds between requests to same provider
+
     def __init__(self, provider, email, password):
         self.provider = provider
         self.email = email
         self.password = password
         self.base = 'https://x.mnitnetwork.com' if provider == 'mnitnetwork' else 'https://stexsms.com'
         self.use_headers = (provider == 'mnitnetwork')
-
-        # Proxy from DB (or env) – sets self.proxies dict
         self.proxies = get_proxy_dict()
-
         self.session = self._create_session()
         self.token = None
         self.token_time = None
         self.TOKEN_TTL = 3600
         self._lock = threading.RLock()
-        self._range_cache = {'data': None, 'timestamp': 0}
 
     def _create_session(self):
         session = requests.Session()
         retry = Retry(
-            total=2,
-            backoff_factor=0.5,
+            total=3,
+            backoff_factor=1,
             status_forcelist=[429, 500, 502, 503, 504],
             allowed_methods=["GET", "POST"]
         )
-        adapter = HTTPAdapter(
-            pool_connections=50,
-            pool_maxsize=50,
-            max_retries=retry,
-            pool_block=False
-        )
+        adapter = HTTPAdapter(pool_connections=50, pool_maxsize=50, max_retries=retry)
         session.mount('https://', adapter)
         session.mount('http://', adapter)
         return session
@@ -524,7 +533,7 @@ class StexSMS:
             except (requests.Timeout, requests.ConnectionError) as e:
                 if attempt == 2:
                     raise RuntimeError(f"Login failed after retries: {e}")
-                time.sleep(0.5)
+                time.sleep(0.5 * (2 ** attempt))
             except Exception as e:
                 raise RuntimeError(f"Login error: {e}")
 
@@ -546,7 +555,8 @@ class StexSMS:
                     kwargs['headers'] = self._headers()
                     continue
                 elif response.status_code == 429:
-                    time.sleep(1)
+                    sleep_time = 1.5 * (2 ** attempt)
+                    time.sleep(sleep_time)
                     continue
                 response.raise_for_status()
             except (requests.Timeout, requests.ConnectionError):
@@ -555,27 +565,17 @@ class StexSMS:
                 time.sleep(1)
         return response
 
-    def get_random_range(self):
-        now = time.time()
-        if self._range_cache['data'] and now - self._range_cache['timestamp'] < 300:
-            return self._range_cache['data']
-        response = self._request('GET', f"{self.base}/mapi/v1/mdashboard/console/info")
-        logs = response.json().get('data', {}).get('logs', [])
-        ranges = [log['number'] for log in logs if 'XXX' in log.get('number', '')]
-        if not ranges:
-            raise RuntimeError('No XXX ranges available')
-        chosen = random.choice(ranges)
-        self._range_cache = {'data': chosen, 'timestamp': now}
-        return chosen
-
     def get_number_with_range(self, phone_range):
-        response = self._request('POST', f"{self.base}/mapi/v1/mdashboard/getnum/number",
-                                 json={'range': phone_range})
-        raw = response.json()['data']['number']
-        return clean_number(raw)
-
-    def get_number(self):
-        return self.get_number_with_range(self.get_random_range())
+        with self._provider_locks[self.provider]:
+            now = time.time()
+            elapsed = now - self._last_request_time[self.provider]
+            if elapsed < self._min_interval:
+                time.sleep(self._min_interval - elapsed)
+            response = self._request('POST', f"{self.base}/mapi/v1/mdashboard/getnum/number",
+                                     json={'range': phone_range})
+            self._last_request_time[self.provider] = time.time()
+            raw = response.json()['data']['number']
+            return clean_number(raw)
 
     def get_numbers_info(self, search=''):
         params = {'date': datetime.now().strftime('%Y-%m-%d'), 'page': 1, 'search': '', 'status': ''}
@@ -638,12 +638,37 @@ def check_rate_limit(chat_id):
 def validate_range(range_str):
     return bool(range_str and 'XXX' in range_str and re.match(r'^[\dX]+$', range_str))
 
+# ---------- Telegram message helpers ----------
+def tg_send(chat_id, text, keyboard=None, parse_mode='HTML'):
+    if not chat_id:
+        return
+    data = {'chat_id': chat_id, 'text': text, 'parse_mode': parse_mode}
+    if keyboard:
+        data['reply_markup'] = json.dumps(keyboard)
+    try:
+        requests.post(f"{TG_API}/sendMessage", data=data, timeout=5)
+    except Exception as e:
+        logging.warning(f"Could not send message to {chat_id}: {e}")
+
+def edit_message(chat_id, message_id, new_text, new_keyboard=None):
+    data = {'chat_id': chat_id, 'message_id': message_id, 'text': new_text, 'parse_mode': 'HTML'}
+    if new_keyboard:
+        data['reply_markup'] = json.dumps(new_keyboard)
+    try:
+        requests.post(f"{TG_API}/editMessageText", data=data, timeout=5)
+    except Exception as e:
+        logging.warning(f"Could not edit message {message_id}: {e}")
+
+def send_to_all_groups(text, keyboard=None):
+    for gid in GROUP_IDS:
+        tg_send(gid, text, keyboard)
+
 # ---------- Keyboards ----------
 def main_keyboard(user_id):
     has_creds = any(get_credentials(user_id, p)[0] for p in ['stexsms', 'mnitnetwork'])
     login_text = '🔓 Logout' if has_creds else '🔐 Log IN'
     keyboard = [
-        [{'text': '📞 Get Number'}, {'text': '🔄 Change Number'}],
+        [{'text': '📞 Get Number'}, {'text': '🔄 Change Range'}],
         [{'text': '👤 Fake Name'}, {'text': '🔐 Get 2FA'}],
         [{'text': login_text}, {'text': '📧 Temp Mail'}],
         [{'text': '👤 My Profile'}]
@@ -672,20 +697,6 @@ def gender_keyboard():
 def provider_keyboard():
     return {'keyboard': [[{'text': '🌐 StexSMS'}, {'text': '🌐 MNIT Network'}], [{'text': '⬅️ Back'}]], 'resize_keyboard': True}
 
-def range_mode_keyboard():
-    return {'keyboard': [[{'text': '🎲 Random Range'}, {'text': '✏️ Manual Range'}], [{'text': '⬅️ Back'}]], 'resize_keyboard': True}
-
-def number_options_keyboard(number):
-    return {'inline_keyboard': [[{'text': 'OTP Group ↗️', 'url': 'https://t.me/otpservers'}]]}
-
-def group_message_keyboard():
-    if not BOT_USERNAME:
-        return None
-    return {'inline_keyboard': [[{'text': '🚀 Get Number', 'url': f'https://t.me/{BOT_USERNAME}?start=main'}]]}
-
-def login_provider_keyboard():
-    return {'keyboard': [[{'text': '🌐 StexSMS'}, {'text': '🌐 MNIT Network'}], [{'text': '⬅️ Cancel'}]], 'resize_keyboard': True}
-
 def cancel_keyboard():
     return {'keyboard': [[{'text': '⬅️ Cancel'}]], 'resize_keyboard': True}
 
@@ -702,32 +713,31 @@ def temp_domain_keyboard():
     return {'keyboard': rows, 'resize_keyboard': True}
 
 def wallet_method_keyboard():
-    return {
-        'inline_keyboard': [
-            [{'text': 'Bkash', 'callback_data': 'wallet_bkash'},
-             {'text': 'Rocket', 'callback_data': 'wallet_rocket'},
-             {'text': 'Binance', 'callback_data': 'wallet_binance'}]
-        ]
-    }
+    return {'inline_keyboard': [[{'text': 'Bkash', 'callback_data': 'wallet_bkash'},
+                                 {'text': 'Rocket', 'callback_data': 'wallet_rocket'},
+                                 {'text': 'Binance', 'callback_data': 'wallet_binance'}]]}
 
 def withdraw_method_keyboard():
-    return {
-        'inline_keyboard': [
-            [{'text': 'Bkash', 'callback_data': 'withdraw_method_bkash'},
-             {'text': 'Rocket', 'callback_data': 'withdraw_method_rocket'},
-             {'text': 'Binance', 'callback_data': 'withdraw_method_binance'},
-             {'text': 'Mobile Recharge', 'callback_data': 'withdraw_method_mobile'}]
-        ]
-    }
+    return {'inline_keyboard': [[{'text': 'Bkash', 'callback_data': 'withdraw_method_bkash'},
+                                 {'text': 'Rocket', 'callback_data': 'withdraw_method_rocket'},
+                                 {'text': 'Binance', 'callback_data': 'withdraw_method_binance'},
+                                 {'text': 'Mobile Recharge', 'callback_data': 'withdraw_method_mobile'}]]}
 
 def edit_keyboard():
-    # Added "🌐 Proxy" button
-    return {'keyboard': [
-        [{'text': '💰 Price'}, {'text': '🌐 Proxy'}],
-        [{'text': '⬅️ Back'}]
-    ], 'resize_keyboard': True}
+    return {'keyboard': [[{'text': '💰 Price'}, {'text': '🌐 Proxy'}], [{'text': '⬅️ Back'}]], 'resize_keyboard': True}
 
-# ---------- Message formatters ----------
+def number_copy_keyboard(number):
+    return {'inline_keyboard': [[{'text': '📋 Copy Number', 'callback_data': f'copy_number_{number}'},
+                                 {'text': '🔗 OTP Group', 'url': 'https://t.me/otpservers'}]]}
+
+def otp_copy_keyboard(otp):
+    return {'inline_keyboard': [[{'text': f'📋 Copy OTP', 'callback_data': f'copy_otp_{otp}'}]]}
+
+def group_message_keyboard():
+    if not BOT_USERNAME:
+        return None
+    return {'inline_keyboard': [[{'text': '🚀 Get Number', 'url': f'https://t.me/{BOT_USERNAME}?start=main'}]]}
+
 def format_balance_message(user_id):
     balance = get_user_balance(user_id)
     wallet = get_user_wallet(user_id)
@@ -749,34 +759,6 @@ def format_balance_message(user_id):
         ]
     }
     return text, inline_kb
-
-def format_inbox_message(number, provider, full_message, otp):
-    t = datetime.now().strftime('%I:%M %p')
-    msg = f"📩 <b>Message Received!</b>\n\n📞 <b>Number:</b> <code>+{number}</code>\n🏢 <b>Provider:</b> <code>{provider.upper()}</code>\n"
-    if otp:
-        msg += f"🔑 <b>OTP Code:</b> <code>{otp}</code>\n"
-    msg += f"\n💬 <b>Full Message:</b>\n<blockquote>{escape(full_message)}</blockquote>\n\n🕒 <b>Time:</b> {t}"
-    return msg
-
-def format_failed_message(number, provider):
-    t = datetime.now().strftime('%I:%M %p')
-    return f"""❌ <b>Number Failed!</b>
-
-📞 <b>Number:</b> <code>+{number}</code>
-🏢 <b>Provider:</b> <code>{provider.upper()}</code>
-
-This number can't receive SMS. Try again.
-
-🕒 <b>Time:</b> {t}"""
-
-def format_group_message(number, provider, full_message, otp):
-    t = datetime.now().strftime('%I:%M %p')
-    masked = f"{number[:3]}****{number[-3:]}" if len(number) > 6 else 'Unknown'
-    msg = f"✅ <b>New message received!</b>\n\n📞 <b>Number:</b> <code>+{masked}</code>\n🏢 <b>Provider:</b> <code>{provider.upper()}</code>\n"
-    if otp:
-        msg += f"🔑 <b>OTP:</b> <code>{otp}</code>\n"
-    msg += f"\n💬 <b>Message:</b>\n<blockquote>{escape(full_message)}</blockquote>\n\n🕒 <b>Time:</b> {t}"
-    return msg
 
 def format_identity_message(gender):
     emoji, full_name, username, password = generate_identity(gender)
@@ -805,23 +787,8 @@ Your Code : <code>{code}</code>
     except Exception:
         return "❌ <b>Invalid Secret Key!</b>\n\nCheck format and try again.", False
 
-def tg_send(chat_id, text, keyboard=None, parse_mode='HTML'):
-    if not chat_id:
-        return
-    data = {'chat_id': chat_id, 'text': text, 'parse_mode': parse_mode}
-    if keyboard:
-        data['reply_markup'] = json.dumps(keyboard)
-    try:
-        requests.post(f"{TG_API}/sendMessage", data=data, timeout=5)
-    except Exception as e:
-        logging.warning(f"Could not send message to {chat_id}: {e}")
-
-def send_to_all_groups(text, keyboard=None):
-    for gid in GROUP_IDS:
-        tg_send(gid, text, keyboard)
-
-# ---------- Multi‑number monitoring (unlimited, balance credit) ----------
-def monitor_number_loop(chat_id, number, provider_name, range_used, start_time):
+# ---------- Monitoring with message editing ----------
+def monitor_number_loop(chat_id, number, provider_name, range_used, start_time, msg_id):
     cancel_evt = None
     try:
         bot = get_bot_instance(provider_name, user_id=chat_id)
@@ -835,14 +802,14 @@ def monitor_number_loop(chat_id, number, provider_name, range_used, start_time):
                 'future': None,
                 'cancel': cancel_evt,
                 'provider': provider_name,
-                'start': start_time
+                'start': start_time,
+                'msg_id': msg_id,
+                'last_otp': None
             }
 
-        last_msg_text = ""
         timeout = TIMEOUT_SECONDS
         failed = False
-        custom_email, _ = get_credentials(chat_id, provider_name)
-        using_default = (custom_email is None)
+        using_default = (get_credentials(chat_id, provider_name)[0] is None)
 
         while time.time() - start_time < timeout and not cancel_evt.is_set():
             try:
@@ -855,14 +822,25 @@ def monitor_number_loop(chat_id, number, provider_name, range_used, start_time):
                     if status == 'failed':
                         failed = True
                         break
-                    if status == 'success' and msg and msg != last_msg_text:
-                        last_msg_text = msg
+                    if status == 'success' and msg:
                         otp = bot.extract_otp(msg)
-                        tg_send(chat_id, format_inbox_message(number, provider_name, msg, otp), number_options_keyboard(number))
-                        if otp and GROUP_IDS:
-                            send_to_all_groups(format_group_message(number, provider_name, msg, otp), group_message_keyboard())
-                        if using_default:
-                            credit_user(chat_id, 0.30)
+                        if otp:
+                            with monitors_lock:
+                                info = active_monitors.get(chat_id, {}).get(number)
+                                if info and info.get('last_otp') != otp:
+                                    info['last_otp'] = otp
+                                    # Edit the original number message and replace with OTP copy button
+                                    new_text = f"✅ <b>Number:</b> <code>+{number}</code>\n\n🔐 <b>OTP received!</b>\nTap the button below to copy the code."
+                                    edit_message(chat_id, msg_id, new_text, otp_copy_keyboard(otp))
+                                    # Notify groups (still show OTP there)
+                                    if GROUP_IDS:
+                                        t = datetime.now().strftime('%I:%M %p')
+                                        masked = f"{number[:3]}****{number[-3:]}" if len(number) > 6 else 'Unknown'
+                                        group_msg = f"✅ <b>New message received!</b>\n\n📞 <b>Number:</b> <code>+{masked}</code>\n🏢 <b>Provider:</b> <code>{provider_name.upper()}</code>\n🔑 <b>OTP:</b> <code>{otp}</code>\n\n🕒 <b>Time:</b> {t}"
+                                        send_to_all_groups(group_msg, group_message_keyboard())
+                                    if using_default:
+                                        credit_user(chat_id, 0.30)
+                                    # Stop monitoring after first OTP? We keep but won't re-edit (last_otp prevents)
                 if failed:
                     break
             except Exception as e:
@@ -874,8 +852,8 @@ def monitor_number_loop(chat_id, number, provider_name, range_used, start_time):
                 break
 
         if failed:
-            tg_send(chat_id, format_failed_message(number, provider_name))
-
+            fail_text = f"❌ <b>Number Failed</b>\n\n📞 <b>Number:</b> <code>+{number}</code>\n🏢 <b>Provider:</b> <code>{provider_name.upper()}</code>\n\nThis number can't receive SMS. Try again."
+            edit_message(chat_id, msg_id, fail_text)
     except Exception as e:
         logging.error(f"Monitoring fatal error for {number}: {e}")
         tg_send(chat_id, f"❌ Monitoring error for +{number}: {escape(str(e))}")
@@ -886,19 +864,18 @@ def monitor_number_loop(chat_id, number, provider_name, range_used, start_time):
                 if not active_monitors[chat_id]:
                     del active_monitors[chat_id]
 
-def start_number_monitoring(chat_id, number, provider_name, range_used):
+def start_number_monitoring(chat_id, number, provider_name, range_used, msg_id):
     with monitors_lock:
         if chat_id not in active_monitors:
             active_monitors[chat_id] = {}
         if number in active_monitors[chat_id]:
             return
-
-    future = executor.submit(monitor_number_loop, chat_id, number, provider_name, range_used, time.time())
+    future = executor.submit(monitor_number_loop, chat_id, number, provider_name, range_used, time.time(), msg_id)
     with monitors_lock:
         if chat_id in active_monitors and number in active_monitors[chat_id]:
             active_monitors[chat_id][number]['future'] = future
 
-def handle_create_number(provider, chat_id, manual_range=None):
+def handle_create_number(provider, chat_id, user_range):
     try:
         allowed, remaining = check_rate_limit(chat_id)
         if not allowed:
@@ -906,79 +883,28 @@ def handle_create_number(provider, chat_id, manual_range=None):
             return
 
         bot = get_bot_instance(provider, user_id=chat_id)
+        number = bot.get_number_with_range(user_range)
+        timeout_min = TIMEOUT_SECONDS // 60
 
-        if manual_range:
-            number = bot.get_number_with_range(manual_range)
-            with states_lock:
-                user_latest_range[chat_id] = manual_range
-                user_latest_provider[chat_id] = provider
-        else:
-            number = bot.get_number()
-
-        timeout_minutes = TIMEOUT_SECONDS // 60
-        tg_send(chat_id,
-                f"📞 <b>Your number:</b> <code>+{number}</code>\n\n🔄 Monitoring started – all messages within {timeout_minutes} mins.",
-                number_options_keyboard(number))
-        start_number_monitoring(chat_id, number, provider, manual_range if manual_range else 'Random')
-
+        # Send message with inline copy button
+        msg_text = f"📞 <b>Your number:</b> <code>+{number}</code>\n\n⌛️ Monitoring for {timeout_min} minutes.\nTap the button below to copy the number."
+        sent = requests.post(f"{TG_API}/sendMessage",
+                             data={'chat_id': chat_id, 'text': msg_text, 'parse_mode': 'HTML',
+                                   'reply_markup': json.dumps(number_copy_keyboard(number))},
+                             timeout=5).json()
+        msg_id = sent['result']['message_id']
+        start_number_monitoring(chat_id, number, provider, user_range, msg_id)
     except Exception as e:
         tg_send(chat_id, f"❌ Error: {escape(str(e))}", main_keyboard(chat_id))
 
-# ---------- Login flow ----------
-def start_login(chat_id):
+def handle_change_range(provider, chat_id):
     with states_lock:
-        user_states[chat_id] = {'step': 'awaiting_login_provider'}
-    tg_send(chat_id, "🔐 <b>Select provider to log in:</b>", login_provider_keyboard())
-
-def process_login_provider(chat_id, text):
-    if text == '⬅️ Cancel':
-        with states_lock: user_states.pop(chat_id, None)
-        tg_send(chat_id, "Login cancelled.", main_keyboard(chat_id))
-        return
-    provider = 'stexsms' if 'Stex' in text else 'mnitnetwork'
-    with states_lock:
-        user_states[chat_id] = {'step': 'awaiting_login_email', 'provider': provider}
-    tg_send(chat_id, f"📧 <b>Enter your email for {text}:</b>\n\n<i>Example: user@example.com</i>", cancel_keyboard())
-
-def process_login_email(chat_id, text, state):
-    if text == '⬅️ Cancel':
-        with states_lock: user_states.pop(chat_id, None)
-        tg_send(chat_id, "Login cancelled.", main_keyboard(chat_id))
-        return
-    email = text.strip()
-    if '@' not in email or '.' not in email:
-        tg_send(chat_id, "❌ Invalid email format. Try again or Cancel.", cancel_keyboard())
-        return
-    state['email'] = email
-    state['step'] = 'awaiting_login_password'
-    tg_send(chat_id, "🔒 <b>Enter your password:</b>", cancel_keyboard())
-
-def process_login_password(chat_id, text, state):
-    if text == '⬅️ Cancel':
-        with states_lock: user_states.pop(chat_id, None)
-        tg_send(chat_id, "Login cancelled.", main_keyboard(chat_id))
-        return
-    password = text.strip()
-    provider = state['provider']
-    email = state['email']
-    try:
-        test_bot = StexSMS(provider=provider, email=email, password=password)
-        test_bot.login()
-    except Exception as e:
-        tg_send(chat_id, f"❌ <b>Login failed:</b> {escape(str(e))}", cancel_keyboard())
-        return
-    save_credentials(chat_id, provider, email, password)
-    with instances_lock:
-        cache_key = (provider, chat_id)
-        if cache_key in bot_instances:
-            del bot_instances[cache_key]
-    with states_lock: user_states.pop(chat_id, None)
-    name = 'StexSMS' if provider == 'stexsms' else 'MNIT Network'
-    tg_send(chat_id, f"✅ <b>Logged into {name}!</b>", main_keyboard(chat_id))
-
-def handle_logout(chat_id):
-    logout_user(chat_id)
-    tg_send(chat_id, "🔓 <b>Logged out.</b> Using default accounts.", main_keyboard(chat_id))
+        user_states[chat_id] = {'step': 'awaiting_range_change', 'provider': provider}
+    current_range = get_user_range(chat_id, provider)
+    prompt = "✏️ <b>Enter the range:</b>\n\n📝 Example: <code>2250163333XXX</code>\n⚠️ Must contain <b>XXX</b>"
+    if current_range:
+        prompt += f"\n\n📌 <b>Current Range:</b> <code>{escape(current_range)}</code>"
+    tg_send(chat_id, prompt, cancel_keyboard())
 
 # ---------- TempMail background ----------
 def temp_inbox_watcher():
@@ -1000,7 +926,7 @@ def temp_inbox_watcher():
                     continue
                 body = fetch_mail_content(email, mid)
                 subject = mail.get("subject", "") or ""
-                otp = extract_otp_temp(body) or extract_otp_temp(subject)
+                otp = extract_otp_universal(body) or extract_otp_universal(subject)
                 with temp_email_lock:
                     if uid not in user_temp_emails:
                         continue
@@ -1040,12 +966,10 @@ threading.Thread(target=temp_cleanup, daemon=True).start()
 
 # ---------- Broadcast helper ----------
 def broadcast_message(admin_chat_id, msg):
-    """Send the admin's message to every user in the database."""
     with db_lock:
         conn = sqlite3.connect(DB_FILE)
         user_ids = [row[0] for row in conn.execute('SELECT user_id FROM users').fetchall()]
         conn.close()
-
     sent, failed = 0, 0
     for uid in user_ids:
         try:
@@ -1053,10 +977,9 @@ def broadcast_message(admin_chat_id, msg):
                           data={'chat_id': uid, 'from_chat_id': admin_chat_id, 'message_id': msg['message_id']},
                           timeout=5)
             sent += 1
-        except Exception as e:
+        except Exception:
             failed += 1
         time.sleep(0.05)
-
     tg_send(admin_chat_id, f"📢 Broadcast completed: {sent} sent, {failed} failed.", main_keyboard(admin_chat_id))
 
 # ---------- Telegram polling ----------
@@ -1083,9 +1006,14 @@ def run_telegram_bot():
                     except Exception:
                         pass
 
-                    if data == 'profile_set_wallet':
+                    if data.startswith('copy_number_'):
+                        number = data.split('_', 2)[2]
+                        tg_send(chat_id, f"📞 <b>Number copied:</b>\n<code>+{number}</code>")
+                    elif data.startswith('copy_otp_'):
+                        otp = data.split('_', 2)[2]
+                        tg_send(chat_id, f"🔑 <b>OTP copied:</b>\n<code>{otp}</code>")
+                    elif data == 'profile_set_wallet':
                         tg_send(chat_id, "🔧 <b>Select wallet to set:</b>", wallet_method_keyboard())
-
                     elif data.startswith('wallet_'):
                         method = data.replace('wallet_', '')
                         with states_lock:
@@ -1095,10 +1023,8 @@ def run_telegram_bot():
                         else:
                             prompt = f"📱 <b>Enter your {method.capitalize()} number:</b>"
                         tg_send(chat_id, prompt, cancel_keyboard())
-
                     elif data == 'profile_withdraw':
                         tg_send(chat_id, "💸 <b>Select withdrawal method:</b>", withdraw_method_keyboard())
-
                     elif data.startswith('withdraw_method_'):
                         method = data.replace('withdraw_method_', '')
                         wallet = get_user_wallet(chat_id)
@@ -1128,7 +1054,6 @@ def run_telegram_bot():
                             f"<b>Please enter the amount you want to withdraw (in BDT):</b>"
                         )
                         tg_send(chat_id, msg, cancel_keyboard())
-
                     elif data.startswith('admin_complete_'):
                         if not is_admin(chat_id):
                             tg_send(chat_id, "Unauthorized.")
@@ -1154,10 +1079,6 @@ def run_telegram_bot():
                                 kb_buttons.append([{'text': f'✅ Complete #{p["id"]}', 'callback_data': f'admin_complete_{p["id"]}'}])
                             kb = {'inline_keyboard': kb_buttons}
                             tg_send(chat_id, "📋 <b>Pending Withdrawals:</b>\n\n" + "\n\n".join(lines), kb)
-
-                    else:
-                        if data == 'go_back':
-                            tg_send(chat_id, 'Main menu:', main_keyboard(chat_id))
                     continue
 
                 # ----- Text messages -----
@@ -1169,7 +1090,7 @@ def run_telegram_bot():
                     with states_lock:
                         state = user_states.get(chat_id)
 
-                    # ---------- Broadcast capture ----------
+                    # Broadcast capture
                     if state and state.get('step') == 'awaiting_broadcast':
                         if text == '⬅️ Cancel':
                             with states_lock: user_states.pop(chat_id, None)
@@ -1183,7 +1104,7 @@ def run_telegram_bot():
                         threading.Thread(target=broadcast_message, args=(chat_id, msg)).start()
                         continue
 
-                    # wallet detail input
+                    # Wallet detail input
                     if state and state.get('step') == 'awaiting_wallet_detail':
                         if text == '⬅️ Cancel':
                             with states_lock: user_states.pop(chat_id, None)
@@ -1204,7 +1125,7 @@ def run_telegram_bot():
                         tg_send(chat_id, bal_text, bal_kb)
                         continue
 
-                    # withdraw amount input
+                    # Withdraw amount input
                     if state and state.get('step') == 'awaiting_withdraw_amount':
                         if text == '⬅️ Cancel':
                             with states_lock: user_states.pop(chat_id, None)
@@ -1228,7 +1149,7 @@ def run_telegram_bot():
                             tg_send(chat_id, f"❌ {err}", main_keyboard(chat_id))
                         continue
 
-                    # ---------- Admin edit menu (Price & Proxy) ----------
+                    # Admin edit menu (Price & Proxy)
                     if state and state.get('step') == 'edit_menu':
                         if text == '💰 Price':
                             with states_lock:
@@ -1257,7 +1178,7 @@ def run_telegram_bot():
                             tg_send(chat_id, "Use the buttons.", edit_keyboard())
                             continue
 
-                    # proxy input
+                    # Proxy input
                     if state and state.get('step') == 'awaiting_proxy':
                         if text == '⬅️ Cancel' or text == '⬅️ Back':
                             with states_lock: user_states.pop(chat_id, None)
@@ -1268,7 +1189,6 @@ def run_telegram_bot():
                             with states_lock: user_states.pop(chat_id, None)
                             tg_send(chat_id, "✅ Proxy removed.", edit_keyboard())
                             continue
-                        # Basic validation: must contain socks5:// or http://
                         if not (text.startswith('socks5://') or text.startswith('http://') or text.startswith('https://')):
                             tg_send(chat_id, "❌ Invalid proxy URL. Must start with socks5://, http:// or https://", cancel_keyboard())
                             continue
@@ -1277,7 +1197,7 @@ def run_telegram_bot():
                         tg_send(chat_id, f"✅ Proxy updated to:\n<code>{escape(text.strip())}</code>", edit_keyboard())
                         continue
 
-                    # price input
+                    # Price input
                     if state and state.get('step') == 'awaiting_price':
                         if text == '⬅️ Cancel' or text == '⬅️ Back':
                             with states_lock: user_states.pop(chat_id, None)
@@ -1296,77 +1216,63 @@ def run_telegram_bot():
                         tg_send(chat_id, f"✅ Minimum withdrawal updated to {new_min} BDT (${min_usd:.2f}).", profile_keyboard(chat_id))
                         continue
 
-                    # other flows
-                    if state:
-                        step = state.get('step')
-                        if step == 'awaiting_login_provider':
-                            process_login_provider(chat_id, text); continue
-                        elif step == 'awaiting_login_email':
-                            process_login_email(chat_id, text, state); continue
-                        elif step == 'awaiting_login_password':
-                            process_login_password(chat_id, text, state); continue
-                        elif step == 'awaiting_range':
-                            if text == '⬅️ Back':
-                                with states_lock: user_states.pop(chat_id, None)
-                                tg_send(chat_id, 'Select provider:', provider_keyboard()); continue
-                            if not validate_range(text):
-                                tg_send(chat_id, '❌ Invalid range!'); continue
-                            prov = state['provider']
+                    # Range change input
+                    if state and state.get('step') == 'awaiting_range_change':
+                        if text == '⬅️ Cancel':
                             with states_lock: user_states.pop(chat_id, None)
-                            tg_send(chat_id, f"🔍 Getting number from: <code>{escape(text)}</code>...")
-                            handle_create_number(prov, chat_id, manual_range=text); continue
-                        elif step == 'choose_range_mode':
-                            prov = state['provider']
-                            if text == '🎲 Random Range':
-                                with states_lock: user_states.pop(chat_id, None)
-                                handle_create_number(prov, chat_id); continue
-                            elif text == '✏️ Manual Range':
-                                with states_lock: user_states[chat_id] = {'step': 'awaiting_range', 'provider': prov}
-                                prompt = '✏️ <b>Enter the range:</b>\n\n📝 Example: <code>2250163333XXX</code>\n⚠️ Must contain <b>XXX</b>'
-                                latest = user_latest_range.get(chat_id)
-                                if latest: prompt += f'\n\n📝 <b>Latest Range:</b> <code>{escape(latest)}</code>'
-                                tg_send(chat_id, prompt, {'keyboard': [[{'text': '⬅️ Back'}]], 'resize_keyboard': True}); continue
-                            elif text == '⬅️ Back':
-                                with states_lock: user_states.pop(chat_id, None)
-                                tg_send(chat_id, 'Select provider:', provider_keyboard()); continue
-                        elif step == 'awaiting_gender':
-                            if text == '⬅️ Back':
-                                with states_lock: user_states.pop(chat_id, None)
-                                tg_send(chat_id, 'Welcome!', main_keyboard(chat_id)); continue
-                            elif text in ['👨 Male', '👩 Female']:
-                                gender = 'male' if 'Male' in text else 'female'
-                                with states_lock: user_states.pop(chat_id, None)
-                                tg_send(chat_id, format_identity_message(gender), main_keyboard(chat_id)); continue
-                        elif step == 'awaiting_2fa_secret':
-                            if text == '⬅️ Back':
-                                with states_lock: user_states.pop(chat_id, None)
-                                tg_send(chat_id, 'Welcome!', main_keyboard(chat_id)); continue
-                            else:
-                                with states_lock: user_states.pop(chat_id, None)
-                                msg2, success = format_2fa_code(text)
-                                tg_send(chat_id, msg2, main_keyboard(chat_id)); continue
-                        elif step == 'awaiting_temp_domain':
-                            if text == '⬅️ Cancel':
-                                with states_lock: user_states.pop(chat_id, None)
-                                tg_send(chat_id, 'Cancelled.', main_keyboard(chat_id)); continue
-                            if text not in AVAILABLE_DOMAINS:
-                                tg_send(chat_id, 'Please select a domain.', temp_domain_keyboard()); continue
-                            email = generate_temp_email(text)
-                            with temp_email_lock:
-                                if chat_id not in user_temp_emails:
-                                    user_temp_emails[chat_id] = {"emails": [], "last_active": time.time()}
-                                user_temp_emails[chat_id]["emails"].append({"email": email, "last_mail_id": None})
-                                user_temp_emails[chat_id]["emails"] = user_temp_emails[chat_id]["emails"][-MAX_EMAILS:]
-                                user_temp_emails[chat_id]["last_active"] = time.time()
-                            with states_lock: user_states.pop(chat_id, None)
-                            tg_send(chat_id, f"📧 <b>Your Temp Email</b>\n\n<code>{email}</code>\n\nInbox is monitored.", main_keyboard(chat_id)); continue
+                            tg_send(chat_id, "Range change cancelled.", main_keyboard(chat_id))
+                            continue
+                        if not validate_range(text):
+                            tg_send(chat_id, "❌ Invalid range. Must contain XXX and only digits & X.", cancel_keyboard())
+                            continue
+                        provider = state['provider']
+                        save_user_range(chat_id, provider, text)
+                        with states_lock: user_states.pop(chat_id, None)
+                        tg_send(chat_id, f"✅ Range saved for {provider.upper()}:\n<code>{escape(text)}</code>", main_keyboard(chat_id))
+                        continue
 
-                    # ----- Main menu -----
+                    # Other states (gender, 2FA, temp mail)
+                    if state and state.get('step') == 'awaiting_gender':
+                        if text == '⬅️ Back':
+                            with states_lock: user_states.pop(chat_id, None)
+                            tg_send(chat_id, 'Welcome!', main_keyboard(chat_id)); continue
+                        elif text in ['👨 Male', '👩 Female']:
+                            gender = 'male' if 'Male' in text else 'female'
+                            with states_lock: user_states.pop(chat_id, None)
+                            tg_send(chat_id, format_identity_message(gender), main_keyboard(chat_id)); continue
+                    if state and state.get('step') == 'awaiting_2fa_secret':
+                        if text == '⬅️ Back':
+                            with states_lock: user_states.pop(chat_id, None)
+                            tg_send(chat_id, 'Welcome!', main_keyboard(chat_id)); continue
+                        else:
+                            with states_lock: user_states.pop(chat_id, None)
+                            msg2, success = format_2fa_code(text)
+                            tg_send(chat_id, msg2, main_keyboard(chat_id)); continue
+                    if state and state.get('step') == 'awaiting_temp_domain':
+                        if text == '⬅️ Cancel':
+                            with states_lock: user_states.pop(chat_id, None)
+                            tg_send(chat_id, 'Cancelled.', main_keyboard(chat_id)); continue
+                        if text not in AVAILABLE_DOMAINS:
+                            tg_send(chat_id, 'Please select a domain.', temp_domain_keyboard()); continue
+                        email = generate_temp_email(text)
+                        with temp_email_lock:
+                            if chat_id not in user_temp_emails:
+                                user_temp_emails[chat_id] = {"emails": [], "last_active": time.time()}
+                            user_temp_emails[chat_id]["emails"].append({"email": email, "last_mail_id": None})
+                            user_temp_emails[chat_id]["emails"] = user_temp_emails[chat_id]["emails"][-MAX_EMAILS:]
+                            user_temp_emails[chat_id]["last_active"] = time.time()
+                        with states_lock: user_states.pop(chat_id, None)
+                        tg_send(chat_id, f"📧 <b>Your Temp Email</b>\n\n<code>{email}</code>\n\nInbox is monitored.", main_keyboard(chat_id)); continue
+
+                    # ----- Main menu commands -----
                     if text.startswith('/start'):
                         parts = text.split()
                         payload = parts[1] if len(parts) > 1 else None
                         with states_lock: user_states.pop(chat_id, None)
                         if payload == 'getnumber':
+                            # For compatibility, show provider selection for get number
+                            with states_lock:
+                                user_states[chat_id] = {'action': 'get_number'}
                             tg_send(chat_id, 'Select provider:', provider_keyboard())
                         else:
                             tg_send(chat_id, 'Welcome! Choose an option:', main_keyboard(chat_id))
@@ -1375,24 +1281,46 @@ def run_telegram_bot():
                     if text == '⬅️ Back':
                         with states_lock: user_states.pop(chat_id, None)
                         tg_send(chat_id, 'Welcome! Choose an option:', main_keyboard(chat_id))
+                        continue
 
-                    elif text == '📞 Get Number':
+                    # ----- Get Number flow -----
+                    if text == '📞 Get Number':
+                        with states_lock:
+                            user_states[chat_id] = {'action': 'get_number'}
                         tg_send(chat_id, 'Select provider:', provider_keyboard())
-                    elif text == '🔄 Change Number':
-                        latest_range = user_latest_range.get(chat_id)
-                        latest_provider = user_latest_provider.get(chat_id)
-                        if latest_range and latest_provider:
-                            tg_send(chat_id, f"🔄 Fetching new number from range: <code>{escape(latest_range)}</code>...")
-                            handle_create_number(latest_provider, chat_id, manual_range=latest_range)
-                        else:
-                            tg_send(chat_id, "❌ No manual range found.\nUse <b>📞 Get Number</b> → <b>✏️ Manual Range</b> first.", main_keyboard(chat_id))
+                        continue
 
-                    elif text == '🌐 StexSMS':
-                        with states_lock: user_states[chat_id] = {'step': 'choose_range_mode', 'provider': 'stexsms'}
-                        tg_send(chat_id, '🔧 <b>Choose range mode:</b>', range_mode_keyboard())
-                    elif text == '🌐 MNIT Network':
-                        with states_lock: user_states[chat_id] = {'step': 'choose_range_mode', 'provider': 'mnitnetwork'}
-                        tg_send(chat_id, '🔧 <b>Choose range mode:</b>', range_mode_keyboard())
+                    # ----- Change Range flow -----
+                    if text == '🔄 Change Range':
+                        with states_lock:
+                            user_states[chat_id] = {'action': 'change_range'}
+                        tg_send(chat_id, 'Select provider:', provider_keyboard())
+                        continue
+
+                    # Provider selection for either action
+                    if text in ['🌐 StexSMS', '🌐 MNIT Network']:
+                        provider = 'stexsms' if 'Stex' in text else 'mnitnetwork'
+                        with states_lock:
+                            state = user_states.get(chat_id)
+                            if not state or state.get('action') not in ('get_number', 'change_range'):
+                                # fallback: treat as get number
+                                action = 'get_number'
+                            else:
+                                action = state['action']
+                        if action == 'get_number':
+                            saved_range = get_user_range(chat_id, provider)
+                            if not saved_range:
+                                tg_send(chat_id, f"❌ No range set for {text}.\nUse <b>Change Range</b> first.", main_keyboard(chat_id))
+                                with states_lock: user_states.pop(chat_id, None)
+                                continue
+                            with states_lock: user_states.pop(chat_id, None)
+                            handle_create_number(provider, chat_id, saved_range)
+                        elif action == 'change_range':
+                            handle_change_range(provider, chat_id)
+                            with states_lock: user_states.pop(chat_id, None)
+                        continue
+
+                    # Other buttons (unchanged from original)
                     elif text == '👤 Fake Name':
                         with states_lock: user_states[chat_id] = {'step': 'awaiting_gender'}
                         tg_send(chat_id, '👤 <b>Select Gender:</b>', gender_keyboard())
@@ -1402,13 +1330,16 @@ def run_telegram_bot():
                     elif text in ['🔐 Log IN', '🔓 Logout']:
                         has_creds = any(get_credentials(chat_id, p)[0] for p in ['stexsms', 'mnitnetwork'])
                         if has_creds:
-                            handle_logout(chat_id)
+                            logout_user(chat_id)
+                            tg_send(chat_id, "🔓 <b>Logged out.</b> Using default accounts.", main_keyboard(chat_id))
                         else:
-                            start_login(chat_id)
+                            # start login flow (original)
+                            with states_lock:
+                                user_states[chat_id] = {'step': 'awaiting_login_provider'}
+                            tg_send(chat_id, "🔐 <b>Select provider to log in:</b>", provider_keyboard())
                     elif text == '📧 Temp Mail':
                         with states_lock: user_states[chat_id] = {'step': 'awaiting_temp_domain'}
                         tg_send(chat_id, '🌐 <b>Select a domain:</b>', temp_domain_keyboard())
-
                     elif text == '👤 My Profile':
                         with states_lock: user_states.pop(chat_id, None)
                         tg_send(chat_id, "👤 <b>Profile Menu</b>", profile_keyboard(chat_id))
@@ -1428,33 +1359,6 @@ def run_telegram_bot():
                                     f"   🕒 {h['completed_time']}"
                                 )
                             tg_send(chat_id, "📋 <b>Withdraw History:</b>\n\n" + "\n\n".join(lines))
-                    elif text == '📋 Withdraw List':
-                        if not is_admin(chat_id):
-                            tg_send(chat_id, "❌ Unauthorized.")
-                            continue
-                        pendings = get_pending_requests()
-                        if not pendings:
-                            tg_send(chat_id, "No pending withdrawal requests.")
-                        else:
-                            lines = []
-                            kb_buttons = []
-                            for p in pendings:
-                                lines.append(
-                                    f"🔹 <b>ID:</b> {p['id']} | <b>User:</b> {p['user_id']}\n"
-                                    f"   💵 {p['amount_bdt']} BDT via {p['method']} ({p['wallet_detail']})\n"
-                                    f"   🕒 {p['time']}"
-                                )
-                                kb_buttons.append([{'text': f'✅ Complete #{p["id"]}', 'callback_data': f'admin_complete_{p["id"]}'}])
-                            kb = {'inline_keyboard': kb_buttons}
-                            tg_send(chat_id, "📋 <b>Pending Withdrawals:</b>\n\n" + "\n\n".join(lines), kb)
-                    elif text == '✏️ Edit':
-                        if not is_admin(chat_id):
-                            tg_send(chat_id, "❌ Unauthorized.")
-                            continue
-                        with states_lock:
-                            user_states[chat_id] = {'step': 'edit_menu'}
-                        tg_send(chat_id, "🔧 <b>Edit Menu</b>", edit_keyboard())
-
                     elif text == '📋 Pending':
                         if not is_admin(chat_id):
                             tg_send(chat_id, "❌ Unauthorized.")
@@ -1474,7 +1378,6 @@ def run_telegram_bot():
                                 kb_buttons.append([{'text': f'✅ Complete #{p["id"]}', 'callback_data': f'admin_complete_{p["id"]}'}])
                             kb = {'inline_keyboard': kb_buttons}
                             tg_send(chat_id, "📋 <b>Pending Withdrawals:</b>\n\n" + "\n\n".join(lines), kb)
-
                     elif text == '✅ Approved':
                         if not is_admin(chat_id):
                             tg_send(chat_id, "❌ Unauthorized.")
@@ -1491,7 +1394,13 @@ def run_telegram_bot():
                                     f"   📅 {h['completed_time']}"
                                 )
                             tg_send(chat_id, "✅ <b>Approved Withdrawals (all users):</b>\n\n" + "\n\n".join(lines), main_keyboard(chat_id))
-
+                    elif text == '✏️ Edit':
+                        if not is_admin(chat_id):
+                            tg_send(chat_id, "❌ Unauthorized.")
+                            continue
+                        with states_lock:
+                            user_states[chat_id] = {'step': 'edit_menu'}
+                        tg_send(chat_id, "🔧 <b>Edit Menu</b>", edit_keyboard())
                     elif text == '📢 Broadcast':
                         if not is_admin(chat_id):
                             tg_send(chat_id, "❌ Unauthorized.")
@@ -1499,8 +1408,54 @@ def run_telegram_bot():
                         with states_lock:
                             user_states[chat_id] = {'step': 'awaiting_broadcast'}
                         tg_send(chat_id, "📣 <b>Send me the message, photo, video, or file you want to broadcast to all users.</b>\n<i>Type /cancel or press Cancel to abort.</i>", cancel_keyboard())
-
                     else:
+                        # Handle login steps that were not caught above
+                        if state and state.get('step') == 'awaiting_login_provider':
+                            if text == '⬅️ Cancel':
+                                with states_lock: user_states.pop(chat_id, None)
+                                tg_send(chat_id, "Login cancelled.", main_keyboard(chat_id))
+                                continue
+                            provider = 'stexsms' if 'Stex' in text else 'mnitnetwork'
+                            with states_lock:
+                                user_states[chat_id] = {'step': 'awaiting_login_email', 'provider': provider}
+                            tg_send(chat_id, f"📧 <b>Enter your email for {text}:</b>\n\n<i>Example: user@example.com</i>", cancel_keyboard())
+                            continue
+                        if state and state.get('step') == 'awaiting_login_email':
+                            if text == '⬅️ Cancel':
+                                with states_lock: user_states.pop(chat_id, None)
+                                tg_send(chat_id, "Login cancelled.", main_keyboard(chat_id))
+                                continue
+                            email = text.strip()
+                            if '@' not in email or '.' not in email:
+                                tg_send(chat_id, "❌ Invalid email format. Try again or Cancel.", cancel_keyboard())
+                                continue
+                            state['email'] = email
+                            state['step'] = 'awaiting_login_password'
+                            tg_send(chat_id, "🔒 <b>Enter your password:</b>", cancel_keyboard())
+                            continue
+                        if state and state.get('step') == 'awaiting_login_password':
+                            if text == '⬅️ Cancel':
+                                with states_lock: user_states.pop(chat_id, None)
+                                tg_send(chat_id, "Login cancelled.", main_keyboard(chat_id))
+                                continue
+                            password = text.strip()
+                            provider = state['provider']
+                            email = state['email']
+                            try:
+                                test_bot = StexSMS(provider=provider, email=email, password=password)
+                                test_bot.login()
+                            except Exception as e:
+                                tg_send(chat_id, f"❌ <b>Login failed:</b> {escape(str(e))}", cancel_keyboard())
+                                continue
+                            save_credentials(chat_id, provider, email, password)
+                            with instances_lock:
+                                cache_key = (provider, chat_id)
+                                if cache_key in bot_instances:
+                                    del bot_instances[cache_key]
+                            with states_lock: user_states.pop(chat_id, None)
+                            name = 'StexSMS' if provider == 'stexsms' else 'MNIT Network'
+                            tg_send(chat_id, f"✅ <b>Logged into {name}!</b>", main_keyboard(chat_id))
+                            continue
                         tg_send(chat_id, "I didn't understand that. Use the menu buttons.", main_keyboard(chat_id))
 
         except requests.exceptions.Timeout:
