@@ -1,4 +1,4 @@
-# bot.py – Manual Range Entry Only (No Auto Range)
+# bot.py – Manual Range Entry, Change Number Reuses Last Range, Copy via Alert
 import warnings
 warnings.filterwarnings("ignore", message=".*urllib3.*")
 warnings.filterwarnings("ignore", category=DeprecationWarning)
@@ -543,20 +543,6 @@ class StexSMS:
                 time.sleep(0.5 * (attempt + 1))
         return response
 
-    # We keep get_random_range() for internal use if needed, but we will NOT call it automatically.
-    def get_random_range(self):
-        now = time.time()
-        if self._range_cache['data'] and now - self._range_cache['timestamp'] < 300:
-            return self._range_cache['data']
-        response = self._request('GET', f"{self.base}/mapi/v1/mdashboard/console/info")
-        logs = response.json().get('data', {}).get('logs', [])
-        ranges = [log['number'] for log in logs if 'XXX' in log.get('number', '')]
-        if not ranges:
-            raise RuntimeError('No XXX ranges available')
-        chosen = random.choice(ranges)
-        self._range_cache = {'data': chosen, 'timestamp': now}
-        return chosen
-
     def get_number_with_range(self, phone_range):
         response = self._request('POST', f"{self.base}/mapi/v1/mdashboard/getnum/number",
                                  json={'range': phone_range})
@@ -699,7 +685,7 @@ def edit_keyboard():
     ], 'resize_keyboard': True}
 
 def number_ready_keyboard(number, provider):
-    """Inline keyboard: copy number + OTP Group link"""
+    """Inline keyboard: copy number (alert) + OTP Group link"""
     copy_data = f"copy_{number}"
     kb = {
         'inline_keyboard': [
@@ -710,7 +696,7 @@ def number_ready_keyboard(number, provider):
     return kb
 
 def otp_received_keyboard(otp_code):
-    """Inline keyboard: copy OTP + OTP Group link"""
+    """Inline keyboard: copy OTP (alert) + OTP Group link"""
     copy_data = f"copy_otp_{otp_code}"
     kb = {
         'inline_keyboard': [
@@ -845,11 +831,9 @@ def monitor_number_loop(chat_id, number, provider_name, range_used, start_time):
     try:
         bot = get_bot_instance(provider_name, user_id=chat_id)
 
-        # Register this number in user_active_numbers
         with monitors_lock:
             if chat_id not in user_active_numbers:
                 user_active_numbers[chat_id] = deque(maxlen=3)
-            # If we already have 3 active numbers, cancel the oldest one
             while len(user_active_numbers[chat_id]) >= 3:
                 oldest = user_active_numbers[chat_id][0]
                 if chat_id in active_monitors and oldest in active_monitors[chat_id]:
@@ -938,14 +922,12 @@ def start_number_monitoring(chat_id, number, provider_name, range_used):
         if chat_id in active_monitors and number in active_monitors[chat_id]:
             active_monitors[chat_id][number]['future'] = future
 
-# ---------- Number acquisition (only manual range, never auto) ----------
+# ---------- Number acquisition (manual range only) ----------
 def handle_create_number(provider, chat_id, manual_range):
-    # manual_range MUST be provided – no automatic selection
     if not manual_range or not validate_range(manual_range):
         tg_send(chat_id, "❌ Invalid range. Must contain XXX and only digits & X.", cancel_keyboard())
         return
 
-    # Anti‑flood & ban check
     if is_user_banned(chat_id):
         tg_send(chat_id, "🚫 You are temporarily banned for 5 minutes due to excessive errors.", main_keyboard(chat_id))
         return
@@ -958,7 +940,6 @@ def handle_create_number(provider, chat_id, manual_range):
         bot = get_bot_instance(provider, user_id=chat_id)
         number = bot.get_number_with_range(manual_range)
 
-        # Store range for later "Change Number"
         with states_lock:
             user_latest_range[chat_id] = manual_range
             user_latest_provider[chat_id] = provider
@@ -973,7 +954,6 @@ def handle_create_number(provider, chat_id, manual_range):
             f"⏳ <b>Waiting for OTP...</b>"
         )
         tg_send(chat_id, msg, number_ready_keyboard(number, provider))
-
         start_number_monitoring(chat_id, number, provider, manual_range)
 
     except Exception as e:
@@ -984,7 +964,7 @@ def handle_create_number(provider, chat_id, manual_range):
         else:
             tg_send(chat_id, f"❌ Error: {escape(error_msg)}", main_keyboard(chat_id))
 
-# ---------- Login flow (unchanged) ----------
+# ---------- Login flow ----------
 def start_login(chat_id):
     with states_lock:
         user_states[chat_id] = {'step': 'awaiting_login_provider'}
@@ -1043,7 +1023,7 @@ def handle_logout(chat_id):
     logout_user(chat_id)
     tg_send(chat_id, "🔓 <b>Logged out.</b> Using default accounts.", main_keyboard(chat_id))
 
-# ---------- TempMail background (unchanged) ----------
+# ---------- TempMail background ----------
 def temp_inbox_watcher():
     while True:
         with temp_email_lock:
@@ -1101,7 +1081,7 @@ def temp_cleanup():
 threading.Thread(target=temp_inbox_watcher, daemon=True).start()
 threading.Thread(target=temp_cleanup, daemon=True).start()
 
-# ---------- Broadcast helper (unchanged) ----------
+# ---------- Broadcast helper ----------
 def broadcast_message(admin_chat_id, msg):
     with db_lock:
         conn = sqlite3.connect(DB_FILE)
@@ -1121,7 +1101,7 @@ def broadcast_message(admin_chat_id, msg):
 
     tg_send(admin_chat_id, f"📢 Broadcast completed: {sent} sent, {failed} failed.", main_keyboard(admin_chat_id))
 
-# ---------- Telegram polling (with callback handling for copy) ----------
+# ---------- Telegram polling ----------
 def run_telegram_bot():
     warmup_default_bots()
     offset = 0
@@ -1150,7 +1130,7 @@ def run_telegram_bot():
                             otp_code = data[9:]
                             try:
                                 requests.post(f"{TG_API}/answerCallbackQuery",
-                                              data={'callback_query_id': cq['id'], 'text': f'OTP: {otp_code}', 'show_alert': True},
+                                              data={'callback_query_id': cq['id'], 'text': f'🔑 OTP: {otp_code}', 'show_alert': True},
                                               timeout=5)
                             except Exception:
                                 pass
@@ -1158,7 +1138,7 @@ def run_telegram_bot():
                             number = data[5:]
                             try:
                                 requests.post(f"{TG_API}/answerCallbackQuery",
-                                              data={'callback_query_id': cq['id'], 'text': f'Number: +{number}', 'show_alert': True},
+                                              data={'callback_query_id': cq['id'], 'text': f'📞 Number: +{number}', 'show_alert': True},
                                               timeout=5)
                             except Exception:
                                 pass
@@ -1450,11 +1430,8 @@ def run_telegram_bot():
                         last_range = user_latest_range.get(chat_id)
                         last_provider = user_latest_provider.get(chat_id)
                         if last_range and last_provider:
-                            # Ask for a new range, but suggest the last one
-                            prompt = f"✏️ <b>Send the new range:</b>\n\n📝 Example: <code>2250163333XXX</code>\n⚠️ Must contain <b>XXX</b>\n\n📌 <b>Last used range:</b> <code>{escape(last_range)}</code>"
-                            with states_lock:
-                                user_states[chat_id] = {'step': 'awaiting_range', 'provider': last_provider}
-                            tg_send(chat_id, prompt, cancel_keyboard())
+                            tg_send(chat_id, f"🔄 Fetching a new number from the last used range...")
+                            handle_create_number(last_provider, chat_id, manual_range=last_range)
                         else:
                             tg_send(chat_id, "❌ No previous range found. Please use '📞 Get Number' first.", main_keyboard(chat_id))
 
