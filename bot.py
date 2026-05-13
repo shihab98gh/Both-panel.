@@ -1,4 +1,4 @@
-# bot.py – Optimised Telegram SMS Bot (Single Active Range, Fixed Change Range Flow)
+# bot.py – Optimised Telegram SMS Bot (Multi‑Number, No Limit, Persistent Data, MNIT Fix, DB-stored Proxy)
 import warnings
 warnings.filterwarnings("ignore", message=".*urllib3.*")
 warnings.filterwarnings("ignore", category=DeprecationWarning)
@@ -13,15 +13,19 @@ from concurrent.futures import ThreadPoolExecutor
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-# ---------- Logging ----------
+# ---------- Logging suppression (except file logger for debugging) ----------
 logging.getLogger().setLevel(logging.WARNING)
+
+# Ensure /data directory exists before creating log file
 os.makedirs('/data', exist_ok=True)
+
 file_handler = logging.FileHandler('/data/bot_debug.log', mode='a')
 file_handler.setLevel(logging.INFO)
 formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 file_handler.setFormatter(formatter)
 root_logger = logging.getLogger()
 root_logger.addHandler(file_handler)
+
 for lname in ['urllib3', 'requests', 'faker', 'pyotp']:
     logging.getLogger(lname).setLevel(logging.WARNING)
 
@@ -38,6 +42,7 @@ DEFAULT_STEX_PASSWORD = os.getenv('STEX_PASSWORD')
 DEFAULT_MNIT_EMAIL    = os.getenv('MNIT_EMAIL')
 DEFAULT_MNIT_PASSWORD = os.getenv('MNIT_PASSWORD')
 
+# Optional fallback proxy from .env (will be overridden by DB if set)
 PROXY_HTTP_ENV  = os.getenv('PROXY_HTTP')
 PROXY_HTTPS_ENV = os.getenv('PROXY_HTTPS')
 
@@ -55,7 +60,7 @@ try:
 except Exception:
     BOT_USERNAME = None
 
-# ---------- Database (WAL) ----------
+# ---------- Database with WAL ----------
 DB_FILE = os.environ.get('DB_PATH', '/data/user_creds.db')
 db_dir = os.path.dirname(DB_FILE)
 if db_dir and not os.path.exists(db_dir):
@@ -76,14 +81,6 @@ def init_db():
                 email     TEXT,
                 password  TEXT,
                 PRIMARY KEY (user_id, provider)
-            )
-        ''')
-        # Single active range per user
-        c.execute('''
-            CREATE TABLE IF NOT EXISTS user_active_range (
-                user_id INTEGER PRIMARY KEY,
-                provider TEXT NOT NULL,
-                range_text TEXT NOT NULL
             )
         ''')
         c.execute('''
@@ -124,7 +121,9 @@ def get_setting(key, default=None):
         conn = sqlite3.connect(DB_FILE)
         row = conn.execute('SELECT value FROM settings WHERE key=?', (key,)).fetchone()
         conn.close()
-        return row[0] if row else default
+        if row:
+            return row[0]
+        return default
 
 def set_setting(key, value):
     with db_lock:
@@ -133,21 +132,24 @@ def set_setting(key, value):
         conn.commit()
         conn.close()
 
-# ---------- Proxy helpers ----------
+# ---------- Proxy helpers (DB first, then env) ----------
 def get_proxy_dict():
+    """Return proxies dict for requests. First check DB, then environment variables."""
     db_proxy = get_setting('proxy_url', '').strip()
     proxies = {}
     if db_proxy:
+        # Use the same URL for both http and https (typical for SOCKS5)
         proxies['http'] = db_proxy
         proxies['https'] = db_proxy
     else:
+        # Fallback to environment variables if DB not set
         if PROXY_HTTP_ENV:
             proxies['http'] = PROXY_HTTP_ENV
         if PROXY_HTTPS_ENV:
             proxies['https'] = PROXY_HTTPS_ENV
     return proxies
 
-# ---------- Wallet / Balance ----------
+# ---------- Wallet / Balance helpers ----------
 def ensure_user_exists(user_id):
     with db_lock:
         conn = sqlite3.connect(DB_FILE)
@@ -240,6 +242,7 @@ def complete_withdrawal(request_id, admin_id):
         conn.execute('UPDATE withdraw_requests SET status="completed", completed_time=? WHERE id=?', (now, request_id))
         conn.commit()
         conn.close()
+
         ex_rate = 125.0
         if method == 'binance':
             amount_display = f"${amount/ex_rate:.4f}"
@@ -256,6 +259,7 @@ def complete_withdrawal(request_id, admin_id):
         else:
             amount_display = f"{amount:.2f} BDT"
             wallet_label = "Wallet"
+
         msg = (
             f"🎉 <b>Withdrawal Approved</b>\n\n"
             f"💵 <b>Amount:</b> {amount_display}\n"
@@ -268,6 +272,277 @@ def complete_withdrawal(request_id, admin_id):
         return user_id
 
 def get_withdrawal_history(user_id=None):
+    with db_lock:
+        conn = sqlite3.connect(DB_FILE)
+        if user_id is None:
+            rows = conn.execute(
+                "SELECT id, user_id, amount_bdt, method, wallet_detail, request_time, completed_time FROM withdraw_requests WHERE status='completed' ORDER BY completed_time DESC LIMIT 200"
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT id, user_id, amount_bdt, method, wallet_detail, request_time, completed_time FROM withdraw_requests WHERE user_id=? AND status='completed' ORDER BY completed_time DESC",
+                (user_id,)
+            ).fetchall()
+        conn.close()
+        return [
+            {'id': r[0], 'user_id': r[1], 'amount_bdt': r[2], 'method': r[3], 'wallet': r[4], 'request_time': r[5], 'completed_time': r[6]}
+            for r in rows
+        ]
+
+def is_admin(user_id):
+    return user_id in ADMIN_IDS
+
+# ---------- Credentials helpers ----------
+def save_credentials(user_id, provider, email, password):
+    with db_lock:
+        conn = sqlite3.connect(DB_FILE, check_same_thread=False)
+        conn.execute('INSERT OR REPLACE INTO user_credentials (user_id, provider, email, password) VALUES (?, ?, ?, ?)',
+                     (user_id, provider, email, password))
+        conn.commit()
+        conn.close()
+
+def get_credentials(user_id, provider):
+    with db_lock:
+        conn = sqlite3.connect(DB_FILE, check_same_thread=False)
+        c = conn.cursor()
+        c.execute('SELECT email, password FROM user_credentials WHERE user_id=? AND provider=?', (user_id, provider))
+        row = c.fetchone()
+        conn.close()
+        return (row[0], row[1]) if row else (None, None)
+
+def delete_credentials(user_id, provider=None):
+    with db_lock:
+        conn = sqlite3.connect(DB_FILE, check_same_thread=False)
+        if provider:
+            conn.execute('DELETE FROM user_credentials WHERE user_id=? AND provider=?', (user_id, provider))
+        else:
+            conn.execute('DELETE FROM user_credentials WHERE user_id=?', (user_id,))
+        conn.commit()
+        conn.close()
+
+# ---------- Rate limit, states, globals ----------
+bot_instances    = {}
+instances_lock   = threading.RLock()
+user_states      = {}
+states_lock      = threading.RLock()
+user_last_request = defaultdict(float)
+user_latest_range = {}
+user_latest_provider = {}
+
+active_monitors = {}
+monitors_lock = threading.RLock()
+executor = ThreadPoolExecutor(max_workers=50)
+fake = Faker('en_US')
+
+RATE_LIMIT_SECONDS = 10
+EXCHANGE_RATE = 125.0
+
+OTP_PATTERN = re.compile(
+    r'<#>\s*(\d[\d\s-]{2,7}\d)\b|'
+    r'(?:code|otp|pin|verification)[:\s]+(\d[\d\s-]{2,7}\d)\b|'
+    r'(\d[\d\s-]{2,7}\d)\s+is\s+your|'
+    r'([A-Z]{2,3}-\d+)|'
+    r'\b(\d{4,8})\b',
+    re.IGNORECASE
+)
+
+def extract_otp_universal(text: str):
+    if not text:
+        return None
+    match = OTP_PATTERN.search(text)
+    if match:
+        for group in match.groups():
+            if group:
+                code = re.sub(r'[\s-]', '', group)
+                if code.isdigit() and 3 <= len(code) <= 8:
+                    return code
+    return None
+
+AVAILABLE_DOMAINS = [
+    "mailto.plus","fexpost.com","fexbox.org","mailbox.in.ua",
+    "rover.info","chitthi.in","fextemp.com","any.pink","merepost.com"
+]
+MAX_EMAILS = 5
+INACTIVE_TIMEOUT = 30 * 60
+FETCH_INTERVAL = 2
+
+user_temp_emails = {}
+temp_email_lock = threading.RLock()
+
+def clean_number(number):
+    return number.lstrip('+').strip() if number else number
+
+def generate_strong_password():
+    special_chars = "!@#$%^&*"
+    chars = string.ascii_letters + string.digits + special_chars
+    password_length = random.randint(10, 12)
+    password = ''.join(random.choice(chars) for _ in range(password_length))
+    bdt_time = datetime.now() + timedelta(hours=6)
+    password += str(bdt_time.day)
+    return password
+
+def generate_identity(gender):
+    if gender == 'male':
+        first_name = fake.first_name_male()
+        last_name = fake.last_name()
+        emoji = '👨'
+    else:
+        first_name = fake.first_name_female()
+        last_name = fake.last_name()
+        emoji = '👩'
+    full_name = f"{first_name} {last_name}"
+    username = f"{first_name.lower()}{last_name.lower()}{random.randint(10,99)}"
+    password = generate_strong_password()
+    return emoji, full_name, username, password
+
+def generate_temp_email(domain):
+    local = ''.join(random.choices('abcdefghijklmnopqrstuvwxyz0123456789', k=10))
+    return f"{local}@{domain}"
+
+def clean_html(raw_html):
+    raw_html = re.sub(r"<(script|style).*?>.*?</\1>", "", raw_html, flags=re.S)
+    raw_html = re.sub(r"<br\s*/?>|</p>", "\n", raw_html)
+    raw_html = re.sub(r"<[^>]+>", "", raw_html)
+    raw_html = unescape(raw_html)
+    return re.sub(r"\n{2,}", "\n", raw_html).strip()
+
+def extract_otp_temp(text):
+    return extract_otp_universal(text)
+
+def fetch_latest_mail(email):
+    encoded = email.replace("@", "%40")
+    url = f"https://tempmail.plus/api/mails?email={encoded}&first_id=0&epin="
+    headers = {
+        "X-Requested-With": "XMLHttpRequest",
+        "Cookie": f"email={encoded}",
+        "Referer": "https://tempmail.plus/en/"
+    }
+    try:
+        r = requests.get(url, headers=headers, timeout=10)
+        if r.status_code != 200:
+            return None
+        mails = r.json().get("mail_list", [])
+        return mails[0] if mails else None
+    except Exception:
+        return None
+
+def fetch_mail_content(email, mail_id):
+    url = f"https://tempmail.plus/api/mails/{mail_id}"
+    headers = {
+        "X-Requested-With": "XMLHttpRequest",
+        "Cookie": f"email={email.replace('@','%40')}",
+        "Referer": "https://tempmail.plus/en/"
+    }
+    try:
+        r = requests.get(url, headers=headers, timeout=10)
+        if r.status_code != 200:
+            return ""
+        data = r.json()
+        if data.get("text"):
+            return data["text"].strip()
+        if data.get("html"):
+            return clean_html(data["html"])
+        return ""
+    except Exception:
+        return ""
+
+# ---------- StexSMS Class (uses get_proxy_dict) ----------
+class StexSMS:
+    def __init__(self, provider, email, password):
+        self.provider = provider
+        self.email = email
+        self.password = password
+        self.base = 'https://x.mnitnetwork.com' if provider == 'mnitnetwork' else 'https://stexsms.com'
+        self.use_headers = (provider == 'mnitnetwork')
+
+        # Proxy from DB (or env) – sets self.proxies dict
+        self.proxies = get_proxy_dict()
+
+        self.session = self._create_session()
+        self.token = None
+        self.token_time = None
+        self.TOKEN_TTL = 3600
+        self._lock = threading.RLock()
+        self._range_cache = {'data': None, 'timestamp': 0}
+
+    def _create_session(self):
+        session = requests.Session()
+        retry = Retry(
+            total=2,
+            backoff_factor=0.5,
+            status_forcelist=[429, 500, 502, 503, 504],
+            allowed_methods=["GET", "POST"]
+        )
+        adapter = HTTPAdapter(
+            pool_connections=50,
+            pool_maxsize=50,
+            max_retries=retry,
+            pool_block=False
+        )
+        session.mount('https://', adapter)
+        session.mount('http://', adapter)
+        return session
+
+    def _headers(self):
+        h = {'Mauthtoken': self.token}
+        if self.use_headers:
+            h.update({
+                'User-Agent': 'Mozilla/5.0',
+                'Content-Type': 'application/json',
+                'Accept-Encoding': 'gzip, deflate',
+                'Connection': 'keep-alive'
+            })
+        return h
+
+    def ensure_auth(self):
+        with self._lock:
+            if self.token is None or time.time() - self.token_time > self.TOKEN_TTL:
+                self.login()
+
+    def login(self):
+        url = f"{self.base}/mapi/v1/mauth/login"
+        payload = {'email': self.email, 'password': self.password}
+        headers = {'User-Agent': 'Mozilla/5.0'} if self.use_headers else None
+        for attempt in range(3):
+            try:
+                response = self.session.post(url, json=payload, headers=headers, timeout=15, proxies=self.proxies)
+                response.raise_for_status()
+                data = response.json()
+                self.token = (data.get('token') or
+                              data.get('access_token') or
+                              data.get('data', {}).get('token') or
+                              self.session.cookies.get('mauthtoken'))
+                if not self.token:
+                    for cookie in self.session.cookies:
+                        if 'mauthtoken' in cookie.name:
+                            self.token = cookie.value
+                            break
+                if not self.token:
+                    raise RuntimeError(f'Could not extract token from response: {data}')
+                self.token_time = time.time()
+                return
+            except (requests.Timeout, requests.ConnectionError) as e:
+                if attempt == 2:
+                    raise RuntimeError(f"Login failed after retries: {e}")
+                time.sleep(0.5)
+            except Exception as e:
+                raise RuntimeError(f"Login error: {e}")
+
+    def _request(self, method, url, **kwargs):
+        self.ensure_auth()
+        kwargs.setdefault('headers', self._headers())
+        kwargs.setdefault('timeout', 30)
+        kwargs.setdefault('proxies', self.proxies)
+        for attempt in range(2):
+            try:
+                response = self.session.request(method, url, **kwargs)
+                if response.status_code == 200:
+                    return response
+                elif response.status_code == 401 and attempt == 0:
+                    with self._lock:
+                        self.token = None
+                        self.token_time = None
+   ser_id=None):
     with db_lock:
         conn = sqlite3.connect(DB_FILE)
         if user_id is None:
