@@ -1,4 +1,4 @@
-# bot.py – Optimised Telegram SMS Bot (Range‑only, inline copy buttons, fixed 429)
+# bot.py – Optimised Telegram SMS Bot (Single Active Range, No Provider Priority)
 import warnings
 warnings.filterwarnings("ignore", message=".*urllib3.*")
 warnings.filterwarnings("ignore", category=DeprecationWarning)
@@ -78,12 +78,12 @@ def init_db():
                 PRIMARY KEY (user_id, provider)
             )
         ''')
+        # Single active range per user (no provider column needed for selection)
         c.execute('''
-            CREATE TABLE IF NOT EXISTS user_ranges (
-                user_id   INTEGER,
-                provider  TEXT,
-                range_text TEXT,
-                PRIMARY KEY (user_id, provider)
+            CREATE TABLE IF NOT EXISTS user_active_range (
+                user_id INTEGER PRIMARY KEY,
+                provider TEXT NOT NULL,
+                range_text TEXT NOT NULL
             )
         ''')
         c.execute('''
@@ -288,26 +288,28 @@ def get_withdrawal_history(user_id=None):
 def is_admin(user_id):
     return user_id in ADMIN_IDS
 
-# ---------- Range helpers (DB persisted) ----------
-def save_user_range(user_id, provider, range_text):
+# ---------- Active Range helpers (single range per user) ----------
+def save_active_range(user_id, provider, range_text):
     with db_lock:
         conn = sqlite3.connect(DB_FILE)
-        conn.execute('INSERT OR REPLACE INTO user_ranges (user_id, provider, range_text) VALUES (?, ?, ?)',
+        conn.execute('INSERT OR REPLACE INTO user_active_range (user_id, provider, range_text) VALUES (?, ?, ?)',
                      (user_id, provider, range_text))
         conn.commit()
         conn.close()
 
-def get_user_range(user_id, provider):
+def get_active_range(user_id):
     with db_lock:
         conn = sqlite3.connect(DB_FILE)
-        row = conn.execute('SELECT range_text FROM user_ranges WHERE user_id=? AND provider=?', (user_id, provider)).fetchone()
+        row = conn.execute('SELECT provider, range_text FROM user_active_range WHERE user_id=?', (user_id,)).fetchone()
         conn.close()
-        return row[0] if row else None
+        if row:
+            return row[0], row[1]  # provider, range_text
+        return None, None
 
-def delete_user_range(user_id, provider):
+def clear_active_range(user_id):
     with db_lock:
         conn = sqlite3.connect(DB_FILE)
-        conn.execute('DELETE FROM user_ranges WHERE user_id=? AND provider=?', (user_id, provider))
+        conn.execute('DELETE FROM user_active_range WHERE user_id=?', (user_id,))
         conn.commit()
         conn.close()
 
@@ -875,7 +877,11 @@ def start_number_monitoring(chat_id, number, provider_name, range_used, msg_id):
         if chat_id in active_monitors and number in active_monitors[chat_id]:
             active_monitors[chat_id][number]['future'] = future
 
-def handle_create_number(provider, chat_id, user_range):
+def handle_create_number(chat_id):
+    provider, saved_range = get_active_range(chat_id)
+    if not provider or not saved_range:
+        tg_send(chat_id, "❌ No range set. Please use 'Change Range' first.", main_keyboard(chat_id))
+        return
     try:
         allowed, remaining = check_rate_limit(chat_id)
         if not allowed:
@@ -883,7 +889,7 @@ def handle_create_number(provider, chat_id, user_range):
             return
 
         bot = get_bot_instance(provider, user_id=chat_id)
-        number = bot.get_number_with_range(user_range)
+        number = bot.get_number_with_range(saved_range)
         timeout_min = TIMEOUT_SECONDS // 60
 
         # Send message with inline copy button
@@ -893,16 +899,16 @@ def handle_create_number(provider, chat_id, user_range):
                                    'reply_markup': json.dumps(number_copy_keyboard(number))},
                              timeout=5).json()
         msg_id = sent['result']['message_id']
-        start_number_monitoring(chat_id, number, provider, user_range, msg_id)
+        start_number_monitoring(chat_id, number, provider, saved_range, msg_id)
     except Exception as e:
         tg_send(chat_id, f"❌ Error: {escape(str(e))}", main_keyboard(chat_id))
 
-def handle_change_range(provider, chat_id):
+def handle_change_range(chat_id, provider):
     with states_lock:
         user_states[chat_id] = {'step': 'awaiting_range_change', 'provider': provider}
-    current_range = get_user_range(chat_id, provider)
-    prompt = "✏️ <b>Enter the range:</b>\n\n📝 Example: <code>2250163333XXX</code>\n⚠️ Must contain <b>XXX</b>"
-    if current_range:
+    current_provider, current_range = get_active_range(chat_id)
+    prompt = f"✏️ <b>Enter the range for {provider.upper()}:</b>\n\n📝 Example: <code>2250163333XXX</code>\n⚠️ Must contain <b>XXX</b>"
+    if current_provider == provider and current_range:
         prompt += f"\n\n📌 <b>Current Range:</b> <code>{escape(current_range)}</code>"
     tg_send(chat_id, prompt, cancel_keyboard())
 
@@ -1226,9 +1232,9 @@ def run_telegram_bot():
                             tg_send(chat_id, "❌ Invalid range. Must contain XXX and only digits & X.", cancel_keyboard())
                             continue
                         provider = state['provider']
-                        save_user_range(chat_id, provider, text)
+                        save_active_range(chat_id, provider, text)
                         with states_lock: user_states.pop(chat_id, None)
-                        tg_send(chat_id, f"✅ Range saved for {provider.upper()}:\n<code>{escape(text)}</code>", main_keyboard(chat_id))
+                        tg_send(chat_id, f"✅ Active range set to {provider.upper()}:\n<code>{escape(text)}</code>\nUse 'Get Number' to receive SMS.", main_keyboard(chat_id))
                         continue
 
                     # Other states (gender, 2FA, temp mail)
@@ -1270,10 +1276,8 @@ def run_telegram_bot():
                         payload = parts[1] if len(parts) > 1 else None
                         with states_lock: user_states.pop(chat_id, None)
                         if payload == 'getnumber':
-                            # For compatibility, show provider selection for get number
-                            with states_lock:
-                                user_states[chat_id] = {'action': 'get_number'}
-                            tg_send(chat_id, 'Select provider:', provider_keyboard())
+                            # Directly call Get Number
+                            handle_create_number(chat_id)
                         else:
                             tg_send(chat_id, 'Welcome! Choose an option:', main_keyboard(chat_id))
                         continue
@@ -1283,41 +1287,31 @@ def run_telegram_bot():
                         tg_send(chat_id, 'Welcome! Choose an option:', main_keyboard(chat_id))
                         continue
 
-                    # ----- Get Number flow -----
+                    # ----- Get Number (uses active range) -----
                     if text == '📞 Get Number':
-                        with states_lock:
-                            user_states[chat_id] = {'action': 'get_number'}
-                        tg_send(chat_id, 'Select provider:', provider_keyboard())
+                        handle_create_number(chat_id)
                         continue
 
-                    # ----- Change Range flow -----
+                    # ----- Change Range (shows provider selection) -----
                     if text == '🔄 Change Range':
                         with states_lock:
                             user_states[chat_id] = {'action': 'change_range'}
                         tg_send(chat_id, 'Select provider:', provider_keyboard())
                         continue
 
-                    # Provider selection for either action
+                    # Provider selection for change_range only
                     if text in ['🌐 StexSMS', '🌐 MNIT Network']:
                         provider = 'stexsms' if 'Stex' in text else 'mnitnetwork'
                         with states_lock:
                             state = user_states.get(chat_id)
-                            if not state or state.get('action') not in ('get_number', 'change_range'):
-                                # fallback: treat as get number
-                                action = 'get_number'
+                            if not state or state.get('action') != 'change_range':
+                                # fallback: treat as change range
+                                action = 'change_range'
                             else:
                                 action = state['action']
-                        if action == 'get_number':
-                            saved_range = get_user_range(chat_id, provider)
-                            if not saved_range:
-                                tg_send(chat_id, f"❌ No range set for {text}.\nUse <b>Change Range</b> first.", main_keyboard(chat_id))
-                                with states_lock: user_states.pop(chat_id, None)
-                                continue
-                            with states_lock: user_states.pop(chat_id, None)
-                            handle_create_number(provider, chat_id, saved_range)
-                        elif action == 'change_range':
-                            handle_change_range(provider, chat_id)
-                            with states_lock: user_states.pop(chat_id, None)
+                        if action == 'change_range':
+                            handle_change_range(chat_id, provider)
+                            # State is now overwritten by handle_change_range, no need to pop here
                         continue
 
                     # Other buttons (unchanged from original)
@@ -1333,7 +1327,6 @@ def run_telegram_bot():
                             logout_user(chat_id)
                             tg_send(chat_id, "🔓 <b>Logged out.</b> Using default accounts.", main_keyboard(chat_id))
                         else:
-                            # start login flow (original)
                             with states_lock:
                                 user_states[chat_id] = {'step': 'awaiting_login_provider'}
                             tg_send(chat_id, "🔐 <b>Select provider to log in:</b>", provider_keyboard())
