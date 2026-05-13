@@ -1,4 +1,4 @@
-# bot.py – Manual Range Entry, Change Number Reuses Last Range, Copy via Alert
+# bot.py – No Copy Buttons, Only OTP Group Link
 import warnings
 warnings.filterwarnings("ignore", message=".*urllib3.*")
 warnings.filterwarnings("ignore", category=DeprecationWarning)
@@ -684,27 +684,21 @@ def edit_keyboard():
         [{'text': '⬅️ Back'}]
     ], 'resize_keyboard': True}
 
-def number_ready_keyboard(number, provider):
-    """Inline keyboard: copy number (alert) + OTP Group link"""
-    copy_data = f"copy_{number}"
-    kb = {
+def number_ready_keyboard():
+    """Only OTP Group link button (no copy)"""
+    return {
         'inline_keyboard': [
-            [{'text': '📋 Copy Number', 'callback_data': copy_data}],
             [{'text': 'OTP Group ↗️', 'url': 'https://t.me/otpservers'}]
         ]
     }
-    return kb
 
-def otp_received_keyboard(otp_code):
-    """Inline keyboard: copy OTP (alert) + OTP Group link"""
-    copy_data = f"copy_otp_{otp_code}"
-    kb = {
+def otp_received_keyboard():
+    """Only OTP Group link button (no copy OTP)"""
+    return {
         'inline_keyboard': [
-            [{'text': f'📋 Copy OTP: {otp_code}', 'callback_data': copy_data}],
             [{'text': 'OTP Group ↗️', 'url': 'https://t.me/otpservers'}]
         ]
     }
-    return kb
 
 def group_message_keyboard():
     if not BOT_USERNAME:
@@ -872,7 +866,7 @@ def monitor_number_loop(chat_id, number, provider_name, range_used, start_time):
                     if status == 'success' and msg and msg != last_msg_text:
                         last_msg_text = msg
                         otp = bot.extract_otp(msg)
-                        tg_send(chat_id, format_inbox_message(number, provider_name, msg, otp), otp_received_keyboard(otp) if otp else None)
+                        tg_send(chat_id, format_inbox_message(number, provider_name, msg, otp), otp_received_keyboard() if otp else None)
                         if otp and GROUP_IDS:
                             send_to_all_groups(format_group_message(number, provider_name, msg, otp), group_message_keyboard())
                         if using_default:
@@ -953,7 +947,7 @@ def handle_create_number(provider, chat_id, manual_range):
             f"━━━━━━━━━━━━━━━━\n"
             f"⏳ <b>Waiting for OTP...</b>"
         )
-        tg_send(chat_id, msg, number_ready_keyboard(number, provider))
+        tg_send(chat_id, msg, number_ready_keyboard())
         start_number_monitoring(chat_id, number, provider, manual_range)
 
     except Exception as e:
@@ -1101,7 +1095,7 @@ def broadcast_message(admin_chat_id, msg):
 
     tg_send(admin_chat_id, f"📢 Broadcast completed: {sent} sent, {failed} failed.", main_keyboard(admin_chat_id))
 
-# ---------- Telegram polling ----------
+# ---------- Telegram polling (no copy callbacks) ----------
 def run_telegram_bot():
     warmup_default_bots()
     offset = 0
@@ -1125,24 +1119,8 @@ def run_telegram_bot():
                     except Exception:
                         pass
 
-                    if data.startswith('copy_'):
-                        if data.startswith('copy_otp_'):
-                            otp_code = data[9:]
-                            try:
-                                requests.post(f"{TG_API}/answerCallbackQuery",
-                                              data={'callback_query_id': cq['id'], 'text': f'🔑 OTP: {otp_code}', 'show_alert': True},
-                                              timeout=5)
-                            except Exception:
-                                pass
-                        elif data.startswith('copy_'):
-                            number = data[5:]
-                            try:
-                                requests.post(f"{TG_API}/answerCallbackQuery",
-                                              data={'callback_query_id': cq['id'], 'text': f'📞 Number: +{number}', 'show_alert': True},
-                                              timeout=5)
-                            except Exception:
-                                pass
-                    elif data == 'profile_set_wallet':
+                    # All copy callbacks have been removed – only handle wallet/withdrawal/admin
+                    if data == 'profile_set_wallet':
                         tg_send(chat_id, "🔧 <b>Select wallet to set:</b>", wallet_method_keyboard())
                     elif data.startswith('wallet_'):
                         method = data.replace('wallet_', '')
