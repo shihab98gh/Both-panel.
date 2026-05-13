@@ -1,4 +1,4 @@
-# bot.py – Optimised Telegram SMS Bot (No Range Prompt – Direct Number Acquisition)
+# bot.py – Manual Range Entry Only (No Auto Range)
 import warnings
 warnings.filterwarnings("ignore", message=".*urllib3.*")
 warnings.filterwarnings("ignore", category=DeprecationWarning)
@@ -348,8 +348,8 @@ instances_lock   = threading.RLock()
 user_states      = {}
 states_lock      = threading.RLock()
 user_last_request = defaultdict(float)
-user_latest_range = {}
-user_latest_provider = {}
+user_latest_range = {}      # store last used range for "Change Number"
+user_latest_provider = {}   # store last used provider
 
 # Per‑user active numbers (limit 3)
 user_active_numbers = defaultdict(lambda: deque(maxlen=3))
@@ -543,6 +543,7 @@ class StexSMS:
                 time.sleep(0.5 * (attempt + 1))
         return response
 
+    # We keep get_random_range() for internal use if needed, but we will NOT call it automatically.
     def get_random_range(self):
         now = time.time()
         if self._range_cache['data'] and now - self._range_cache['timestamp'] < 300:
@@ -561,9 +562,6 @@ class StexSMS:
                                  json={'range': phone_range})
         raw = response.json()['data']['number']
         return raw.lstrip('+').strip()
-
-    def get_number(self):
-        return self.get_number_with_range(self.get_random_range())
 
     def get_numbers_info(self, search=''):
         params = {'date': datetime.now().strftime('%Y-%m-%d'), 'page': 1, 'search': '', 'status': ''}
@@ -622,6 +620,9 @@ def check_rate_limit(chat_id):
         return False, int(RATE_LIMIT_SECONDS - (now - last))
     user_last_request[chat_id] = now
     return True, 0
+
+def validate_range(range_str):
+    return bool(range_str and 'XXX' in range_str and re.match(r'^[\dX]+$', range_str))
 
 # ---------- Keyboards ----------
 def main_keyboard(user_id):
@@ -837,6 +838,8 @@ def send_to_all_groups(text, keyboard=None):
         tg_send(gid, text, keyboard)
 
 # ---------- Monitoring (only latest 3 numbers per user) ----------
+active_monitors = {}
+
 def monitor_number_loop(chat_id, number, provider_name, range_used, start_time):
     cancel_evt = None
     try:
@@ -935,8 +938,13 @@ def start_number_monitoring(chat_id, number, provider_name, range_used):
         if chat_id in active_monitors and number in active_monitors[chat_id]:
             active_monitors[chat_id][number]['future'] = future
 
-# ---------- Number acquisition (direct, no range prompt) ----------
-def handle_create_number(provider, chat_id, manual_range=None):
+# ---------- Number acquisition (only manual range, never auto) ----------
+def handle_create_number(provider, chat_id, manual_range):
+    # manual_range MUST be provided – no automatic selection
+    if not manual_range or not validate_range(manual_range):
+        tg_send(chat_id, "❌ Invalid range. Must contain XXX and only digits & X.", cancel_keyboard())
+        return
+
     # Anti‑flood & ban check
     if is_user_banned(chat_id):
         tg_send(chat_id, "🚫 You are temporarily banned for 5 minutes due to excessive errors.", main_keyboard(chat_id))
@@ -948,19 +956,12 @@ def handle_create_number(provider, chat_id, manual_range=None):
 
     try:
         bot = get_bot_instance(provider, user_id=chat_id)
-        if manual_range:
-            number = bot.get_number_with_range(manual_range)
-            # Store the range for later "Change Number"
-            with states_lock:
-                user_latest_range[chat_id] = manual_range
-                user_latest_provider[chat_id] = provider
-        else:
-            # No manual range provided -> get a random range and store it
-            chosen_range = bot.get_random_range()
-            number = bot.get_number_with_range(chosen_range)
-            with states_lock:
-                user_latest_range[chat_id] = chosen_range
-                user_latest_provider[chat_id] = provider
+        number = bot.get_number_with_range(manual_range)
+
+        # Store range for later "Change Number"
+        with states_lock:
+            user_latest_range[chat_id] = manual_range
+            user_latest_provider[chat_id] = provider
 
         provider_display = "STEXSMS" if provider == 'stexsms' else "MNIT NETWORK"
         msg = (
@@ -973,7 +974,7 @@ def handle_create_number(provider, chat_id, manual_range=None):
         )
         tg_send(chat_id, msg, number_ready_keyboard(number, provider))
 
-        start_number_monitoring(chat_id, number, provider, manual_range if manual_range else chosen_range)
+        start_number_monitoring(chat_id, number, provider, manual_range)
 
     except Exception as e:
         error_msg = str(e)
@@ -1121,7 +1122,6 @@ def broadcast_message(admin_chat_id, msg):
     tg_send(admin_chat_id, f"📢 Broadcast completed: {sent} sent, {failed} failed.", main_keyboard(admin_chat_id))
 
 # ---------- Telegram polling (with callback handling for copy) ----------
-active_monitors = {}  # declare before use
 def run_telegram_bot():
     warmup_default_bots()
     offset = 0
@@ -1373,7 +1373,21 @@ def run_telegram_bot():
                         tg_send(chat_id, f"✅ Minimum withdrawal updated to {new_min} BDT (${min_usd:.2f}).", profile_keyboard(chat_id))
                         continue
 
-                    # Other states (gender, 2fa, temp mail)
+                    # ---------- Range input state (after provider selection) ----------
+                    if state and state.get('step') == 'awaiting_range':
+                        if text == '⬅️ Cancel':
+                            with states_lock: user_states.pop(chat_id, None)
+                            tg_send(chat_id, "Number request cancelled.", main_keyboard(chat_id))
+                            continue
+                        if not validate_range(text):
+                            tg_send(chat_id, '❌ Invalid range! Must contain XXX and only digits & X.\nExample: 2250163333XXX\nPlease send again or Cancel.', cancel_keyboard())
+                            continue
+                        prov = state['provider']
+                        with states_lock: user_states.pop(chat_id, None)
+                        handle_create_number(prov, chat_id, manual_range=text)
+                        continue
+
+                    # Other states (gender, 2fa, temp mail, login)
                     if state:
                         step = state.get('step')
                         if step == 'awaiting_login_provider':
@@ -1431,20 +1445,36 @@ def run_telegram_bot():
 
                     elif text == '📞 Get Number':
                         tg_send(chat_id, 'Select provider:', provider_keyboard())
+
                     elif text == '🔄 Change Number':
-                        latest_range = user_latest_range.get(chat_id)
-                        latest_provider = user_latest_provider.get(chat_id)
-                        if latest_range and latest_provider:
-                            tg_send(chat_id, f"🔄 Fetching new number from stored range...")
-                            handle_create_number(latest_provider, chat_id, manual_range=latest_range)
+                        last_range = user_latest_range.get(chat_id)
+                        last_provider = user_latest_provider.get(chat_id)
+                        if last_range and last_provider:
+                            # Ask for a new range, but suggest the last one
+                            prompt = f"✏️ <b>Send the new range:</b>\n\n📝 Example: <code>2250163333XXX</code>\n⚠️ Must contain <b>XXX</b>\n\n📌 <b>Last used range:</b> <code>{escape(last_range)}</code>"
+                            with states_lock:
+                                user_states[chat_id] = {'step': 'awaiting_range', 'provider': last_provider}
+                            tg_send(chat_id, prompt, cancel_keyboard())
                         else:
-                            tg_send(chat_id, "❌ No previous range found. Please use 'Get Number' first.", main_keyboard(chat_id))
+                            tg_send(chat_id, "❌ No previous range found. Please use '📞 Get Number' first.", main_keyboard(chat_id))
 
                     elif text == '🌐 StexSMS':
-                        # Directly fetch a number (random range)
-                        handle_create_number('stexsms', chat_id)
+                        with states_lock:
+                            user_states[chat_id] = {'step': 'awaiting_range', 'provider': 'stexsms'}
+                        prompt = "✏️ <b>Please send the range:</b>\n\n📝 Example: <code>2250163333XXX</code>\n⚠️ Must contain <b>XXX</b>"
+                        last = user_latest_range.get(chat_id)
+                        if last:
+                            prompt += f"\n\n📌 <b>Last used range:</b> <code>{escape(last)}</code>"
+                        tg_send(chat_id, prompt, cancel_keyboard())
+
                     elif text == '🌐 MNIT Network':
-                        handle_create_number('mnitnetwork', chat_id)
+                        with states_lock:
+                            user_states[chat_id] = {'step': 'awaiting_range', 'provider': 'mnitnetwork'}
+                        prompt = "✏️ <b>Please send the range:</b>\n\n📝 Example: <code>2250163333XXX</code>\n⚠️ Must contain <b>XXX</b>"
+                        last = user_latest_range.get(chat_id)
+                        if last:
+                            prompt += f"\n\n📌 <b>Last used range:</b> <code>{escape(last)}</code>"
+                        tg_send(chat_id, prompt, cancel_keyboard())
 
                     elif text == '👤 Fake Name':
                         with states_lock: user_states[chat_id] = {'step': 'awaiting_gender'}
