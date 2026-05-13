@@ -1,4 +1,4 @@
-# bot.py – Optimised Telegram SMS Bot (Single Active Range, No Provider Priority)
+# bot.py – Optimised Telegram SMS Bot (Single Active Range, Fixed Change Range Flow)
 import warnings
 warnings.filterwarnings("ignore", message=".*urllib3.*")
 warnings.filterwarnings("ignore", category=DeprecationWarning)
@@ -78,7 +78,7 @@ def init_db():
                 PRIMARY KEY (user_id, provider)
             )
         ''')
-        # Single active range per user (no provider column needed for selection)
+        # Single active range per user
         c.execute('''
             CREATE TABLE IF NOT EXISTS user_active_range (
                 user_id INTEGER PRIMARY KEY,
@@ -903,9 +903,16 @@ def handle_create_number(chat_id):
     except Exception as e:
         tg_send(chat_id, f"❌ Error: {escape(str(e))}", main_keyboard(chat_id))
 
-def handle_change_range(chat_id, provider):
+def handle_change_range(chat_id):
+    # First step: ask for provider
     with states_lock:
-        user_states[chat_id] = {'step': 'awaiting_range_change', 'provider': provider}
+        user_states[chat_id] = {'step': 'awaiting_change_range_provider'}
+    tg_send(chat_id, 'Select provider:', provider_keyboard())
+
+def process_change_range_provider(chat_id, provider):
+    # Second step: ask for range
+    with states_lock:
+        user_states[chat_id] = {'step': 'awaiting_range_input', 'provider': provider}
     current_provider, current_range = get_active_range(chat_id)
     prompt = f"✏️ <b>Enter the range for {provider.upper()}:</b>\n\n📝 Example: <code>2250163333XXX</code>\n⚠️ Must contain <b>XXX</b>"
     if current_provider == provider and current_range:
@@ -1222,8 +1229,8 @@ def run_telegram_bot():
                         tg_send(chat_id, f"✅ Minimum withdrawal updated to {new_min} BDT (${min_usd:.2f}).", profile_keyboard(chat_id))
                         continue
 
-                    # Range change input
-                    if state and state.get('step') == 'awaiting_range_change':
+                    # ----- Change Range second step: awaiting range input -----
+                    if state and state.get('step') == 'awaiting_range_input':
                         if text == '⬅️ Cancel':
                             with states_lock: user_states.pop(chat_id, None)
                             tg_send(chat_id, "Range change cancelled.", main_keyboard(chat_id))
@@ -1235,6 +1242,20 @@ def run_telegram_bot():
                         save_active_range(chat_id, provider, text)
                         with states_lock: user_states.pop(chat_id, None)
                         tg_send(chat_id, f"✅ Active range set to {provider.upper()}:\n<code>{escape(text)}</code>\nUse 'Get Number' to receive SMS.", main_keyboard(chat_id))
+                        continue
+
+                    # ----- Change Range first step: provider selection -----
+                    if state and state.get('step') == 'awaiting_change_range_provider':
+                        if text == '⬅️ Cancel':
+                            with states_lock: user_states.pop(chat_id, None)
+                            tg_send(chat_id, "Range change cancelled.", main_keyboard(chat_id))
+                            continue
+                        if text == '🌐 StexSMS':
+                            process_change_range_provider(chat_id, 'stexsms')
+                        elif text == '🌐 MNIT Network':
+                            process_change_range_provider(chat_id, 'mnitnetwork')
+                        else:
+                            tg_send(chat_id, "Please select a provider from the keyboard.", provider_keyboard())
                         continue
 
                     # Other states (gender, 2FA, temp mail)
@@ -1276,7 +1297,6 @@ def run_telegram_bot():
                         payload = parts[1] if len(parts) > 1 else None
                         with states_lock: user_states.pop(chat_id, None)
                         if payload == 'getnumber':
-                            # Directly call Get Number
                             handle_create_number(chat_id)
                         else:
                             tg_send(chat_id, 'Welcome! Choose an option:', main_keyboard(chat_id))
@@ -1287,31 +1307,14 @@ def run_telegram_bot():
                         tg_send(chat_id, 'Welcome! Choose an option:', main_keyboard(chat_id))
                         continue
 
-                    # ----- Get Number (uses active range) -----
+                    # ----- Get Number (no submenu) -----
                     if text == '📞 Get Number':
                         handle_create_number(chat_id)
                         continue
 
-                    # ----- Change Range (shows provider selection) -----
+                    # ----- Change Range (starts provider selection) -----
                     if text == '🔄 Change Range':
-                        with states_lock:
-                            user_states[chat_id] = {'action': 'change_range'}
-                        tg_send(chat_id, 'Select provider:', provider_keyboard())
-                        continue
-
-                    # Provider selection for change_range only
-                    if text in ['🌐 StexSMS', '🌐 MNIT Network']:
-                        provider = 'stexsms' if 'Stex' in text else 'mnitnetwork'
-                        with states_lock:
-                            state = user_states.get(chat_id)
-                            if not state or state.get('action') != 'change_range':
-                                # fallback: treat as change range
-                                action = 'change_range'
-                            else:
-                                action = state['action']
-                        if action == 'change_range':
-                            handle_change_range(chat_id, provider)
-                            # State is now overwritten by handle_change_range, no need to pop here
+                        handle_change_range(chat_id)
                         continue
 
                     # Other buttons (unchanged from original)
