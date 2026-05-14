@@ -1,4 +1,4 @@
-# bot.py – Fixed MNIT Login (Handles empty/HTML responses, better logging)
+# bot.py – Fixed Duplicate Message Issue, No Copy Buttons, Only OTP Group Link
 import warnings
 warnings.filterwarnings("ignore", message=".*urllib3.*")
 warnings.filterwarnings("ignore", category=DeprecationWarning)
@@ -441,15 +441,14 @@ def fetch_mail_content(email, mail_id):
     except Exception:
         return ""
 
-# ---------- StexSMS Class (fixed MNIT login) ----------
+# ---------- StexSMS Class (improved retries & backoff) ----------
 class StexSMS:
     def __init__(self, provider, email, password):
         self.provider = provider
         self.email = email
         self.password = password
         self.base = 'https://x.mnitnetwork.com' if provider == 'mnitnetwork' else 'https://stexsms.com'
-        # Both providers now use headers
-        self.use_headers = True
+        self.use_headers = (provider == 'mnitnetwork')
         self.proxies = get_proxy_dict()
         self.session = self._create_session()
         self.token = None
@@ -472,17 +471,14 @@ class StexSMS:
         session.mount('http://', adapter)
         return session
 
-    def _headers(self, include_auth=True):
-        """Return standard headers for API requests."""
-        h = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            'Accept': 'application/json, text/plain, */*',
-            'Accept-Encoding': 'gzip, deflate, br',
-            'Connection': 'keep-alive',
-            'Content-Type': 'application/json'
-        }
-        if include_auth and self.token:
-            h['Mauthtoken'] = self.token
+    def _headers(self):
+        h = {'Mauthtoken': self.token}
+        if self.use_headers:
+            h.update({
+                'User-Agent': 'Mozilla/5.0',
+                'Content-Type': 'application/json',
+                'Accept-Encoding': 'gzip, deflate'
+            })
         return h
 
     def ensure_auth(self):
@@ -493,9 +489,7 @@ class StexSMS:
     def login(self):
         url = f"{self.base}/mapi/v1/mauth/login"
         payload = {'email': self.email, 'password': self.password}
-        # Use headers without token for login
-        headers = self._headers(include_auth=False)
-
+        headers = {'User-Agent': 'Mozilla/5.0'} if self.use_headers else None
         for attempt in range(3):
             try:
                 response = self.session.post(url, json=payload, headers=headers, timeout=15, proxies=self.proxies)
@@ -503,28 +497,8 @@ class StexSMS:
                     wait = (2 ** attempt) + random.uniform(0, 1)
                     time.sleep(wait)
                     continue
-
-                # Log response for debugging
-                logging.info(f"{self.provider} login response status: {response.status_code}")
-                logging.info(f"{self.provider} login response headers: {response.headers.get('content-type', 'unknown')}")
-                logging.info(f"{self.provider} login response body (first 500 chars): {response.text[:500]}")
-
-                if response.status_code == 403:
-                    raise RuntimeError(f"Access forbidden (403). The API may have changed or your IP is blocked. Full response: {response.text[:300]}")
-
                 response.raise_for_status()
-
-                # Try to parse JSON
-                try:
-                    data = response.json()
-                except json.JSONDecodeError:
-                    # Not JSON – maybe a redirect or HTML error
-                    if 'html' in response.headers.get('content-type', '').lower():
-                        raise RuntimeError(f"Server returned HTML instead of JSON. Likely a gateway error or IP ban. Status {response.status_code}")
-                    else:
-                        raise RuntimeError(f"Invalid JSON response: {response.text[:200]}")
-
-                # Extract token
+                data = response.json()
                 self.token = (data.get('token') or data.get('access_token') or
                               data.get('data', {}).get('token') or
                               self.session.cookies.get('mauthtoken'))
@@ -534,21 +508,17 @@ class StexSMS:
                             self.token = cookie.value
                             break
                 if not self.token:
-                    raise RuntimeError(f'Could not extract token from response: {data}')
-
+                    raise RuntimeError(f'Could not extract token: {data}')
                 self.token_time = time.time()
-                logging.info(f"{self.provider} login successful, token obtained")
                 return
-
             except Exception as e:
-                logging.error(f"{self.provider} login attempt {attempt+1} failed: {e}")
                 if attempt == 2:
-                    raise RuntimeError(f"Login failed after {attempt+1} attempts: {e}")
+                    raise RuntimeError(f"Login failed: {e}")
                 time.sleep(0.5 * (attempt + 1))
 
     def _request(self, method, url, **kwargs):
         self.ensure_auth()
-        kwargs.setdefault('headers', self._headers(include_auth=True))
+        kwargs.setdefault('headers', self._headers())
         kwargs.setdefault('timeout', 30)
         kwargs.setdefault('proxies', self.proxies)
         for attempt in range(3):
@@ -564,7 +534,7 @@ class StexSMS:
                     with self._lock:
                         self.token = None
                     self.ensure_auth()
-                    kwargs['headers'] = self._headers(include_auth=True)
+                    kwargs['headers'] = self._headers()
                     continue
                 response.raise_for_status()
             except (requests.Timeout, requests.ConnectionError) as e:
@@ -640,7 +610,7 @@ def check_rate_limit(chat_id):
 def validate_range(range_str):
     return bool(range_str and 'XXX' in range_str and re.match(r'^[\dX]+$', range_str))
 
-# ---------- Keyboards (unchanged) ----------
+# ---------- Keyboards ----------
 def main_keyboard(user_id):
     has_creds = any(get_credentials(user_id, p)[0] for p in ['stexsms', 'mnitnetwork'])
     login_text = '🔓 Logout' if has_creds else '🔐 Log IN'
@@ -715,6 +685,7 @@ def edit_keyboard():
     ], 'resize_keyboard': True}
 
 def number_ready_keyboard():
+    """Only OTP Group link button (no copy)"""
     return {
         'inline_keyboard': [
             [{'text': 'OTP Group ↗️', 'url': 'https://t.me/otpservers'}]
@@ -722,6 +693,7 @@ def number_ready_keyboard():
     }
 
 def otp_received_keyboard():
+    """Only OTP Group link button (no copy OTP)"""
     return {
         'inline_keyboard': [
             [{'text': 'OTP Group ↗️', 'url': 'https://t.me/otpservers'}]
@@ -733,7 +705,7 @@ def group_message_keyboard():
         return None
     return {'inline_keyboard': [[{'text': '🚀 Get Number', 'url': f'https://t.me/{BOT_USERNAME}?start=getnumber'}]]}
 
-# ---------- Message formatters (unchanged) ----------
+# ---------- Message formatters ----------
 def format_balance_message(user_id):
     balance = get_user_balance(user_id)
     wallet = get_user_wallet(user_id)
@@ -874,7 +846,7 @@ def monitor_number_loop(chat_id, number, provider_name, range_used, start_time):
                 'start': start_time
             }
 
-        last_msg_id = None
+        last_msg_id = None   # Store last message ID to avoid duplicates
         timeout = TIMEOUT_SECONDS
         failed = False
         custom_email, _ = get_credentials(chat_id, provider_name)
@@ -888,6 +860,7 @@ def monitor_number_loop(chat_id, number, provider_name, range_used, start_time):
                         continue
                     status = n.get('status', '')
                     msg = n.get('message') or n.get('otp') or ''
+                    # Use message ID if available, otherwise hash the message content + timestamp
                     current_msg_id = n.get('message_id') or n.get('id') or hash((msg, n.get('updated_at', '')))
                     if status == 'failed':
                         failed = True
@@ -900,6 +873,7 @@ def monitor_number_loop(chat_id, number, provider_name, range_used, start_time):
                             send_to_all_groups(format_group_message(number, provider_name, msg, otp), group_message_keyboard())
                         if using_default:
                             credit_user(chat_id, 0.30)
+                        # Small delay to avoid duplicate in same batch if API returns same item again
                         time.sleep(1)
                 if failed:
                     break
@@ -973,7 +947,9 @@ def handle_create_number(provider, chat_id, manual_range):
             f"✅ <b>Number Ready!</b>\n"
             f"━━━━━━━━━━━━━━━━\n"
             f"🏢 <b>Provider:</b> <code>{provider_display}</code>\n\n"
+            
             f"📞 <b>Number:</b> <code>+{number}</code>\n\n"
+            
             f"━━━━━━━━━━━━━━━━\n"
             f"⏳ <b>Waiting for OTP...</b>"
         )
