@@ -1,4 +1,4 @@
-# bot.py – Fixed Duplicate Message Issue, No Copy Buttons, Only OTP Group Link
+# bot.py – Fixed MNIT Login, No Copy Buttons, Only OTP Group Link
 import warnings
 warnings.filterwarnings("ignore", message=".*urllib3.*")
 warnings.filterwarnings("ignore", category=DeprecationWarning)
@@ -448,7 +448,9 @@ class StexSMS:
         self.email = email
         self.password = password
         self.base = 'https://x.mnitnetwork.com' if provider == 'mnitnetwork' else 'https://stexsms.com'
-        self.use_headers = (provider == 'mnitnetwork')
+        # Both providers now use headers
+        self.use_headers = True  # Changed: both use headers
+        
         self.proxies = get_proxy_dict()
         self.session = self._create_session()
         self.token = None
@@ -472,13 +474,16 @@ class StexSMS:
         return session
 
     def _headers(self):
-        h = {'Mauthtoken': self.token}
-        if self.use_headers:
-            h.update({
-                'User-Agent': 'Mozilla/5.0',
-                'Content-Type': 'application/json',
-                'Accept-Encoding': 'gzip, deflate'
-            })
+        # Standard headers for both providers
+        h = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept': 'application/json, text/plain, */*',
+            'Accept-Encoding': 'gzip, deflate, br',
+            'Connection': 'keep-alive',
+            'Content-Type': 'application/json'
+        }
+        if self.token:
+            h['Mauthtoken'] = self.token
         return h
 
     def ensure_auth(self):
@@ -489,7 +494,11 @@ class StexSMS:
     def login(self):
         url = f"{self.base}/mapi/v1/mauth/login"
         payload = {'email': self.email, 'password': self.password}
-        headers = {'User-Agent': 'Mozilla/5.0'} if self.use_headers else None
+        # Use standard headers for login as well
+        headers = self._headers()
+        # Remove Mauthtoken as it doesn't exist yet
+        headers.pop('Mauthtoken', None)
+        
         for attempt in range(3):
             try:
                 response = self.session.post(url, json=payload, headers=headers, timeout=15, proxies=self.proxies)
@@ -497,8 +506,18 @@ class StexSMS:
                     wait = (2 ** attempt) + random.uniform(0, 1)
                     time.sleep(wait)
                     continue
+                
+                # Log response for debugging (remove in production if needed)
+                logging.info(f"MNIT login response status: {response.status_code}")
+                logging.info(f"MNIT login response body: {response.text[:500]}")
+                
+                if response.status_code == 403:
+                    raise RuntimeError(f"Access forbidden. The API may have changed or your IP is blocked. Response: {response.text[:200]}")
+                
                 response.raise_for_status()
                 data = response.json()
+                
+                # Try multiple token extraction methods
                 self.token = (data.get('token') or data.get('access_token') or
                               data.get('data', {}).get('token') or
                               self.session.cookies.get('mauthtoken'))
@@ -508,12 +527,13 @@ class StexSMS:
                             self.token = cookie.value
                             break
                 if not self.token:
-                    raise RuntimeError(f'Could not extract token: {data}')
+                    raise RuntimeError(f'Could not extract token from response: {data}')
+                    
                 self.token_time = time.time()
                 return
             except Exception as e:
                 if attempt == 2:
-                    raise RuntimeError(f"Login failed: {e}")
+                    raise RuntimeError(f"Login failed after {attempt+1} attempts: {e}")
                 time.sleep(0.5 * (attempt + 1))
 
     def _request(self, method, url, **kwargs):
