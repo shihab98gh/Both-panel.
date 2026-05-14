@@ -946,9 +946,9 @@ def handle_create_number(provider, chat_id, manual_range):
         msg = (
             f"✅ <b>Number Ready!</b>\n"
             f"━━━━━━━━━━━━━━━━\n"
-            f"🏢 <b>Provider:</b> <code>{provider_display}</code>\n"
+            f"🏢 <b>Provider:</b> <code>{provider_display}</code>\n\n"
             
-            f"📞 <b>Number:</b> <code>+{number}</code>\n"
+            f"📞 <b>Number:</b> <code>+{number}</code>\n\n"
             
             f"━━━━━━━━━━━━━━━━\n"
             f"⏳ <b>Waiting for OTP...</b>"
