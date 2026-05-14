@@ -1,4 +1,4 @@
-# bot.py – No Copy Buttons, Only OTP Group Link
+# bot.py – Fixed Duplicate Message Issue, No Copy Buttons, Only OTP Group Link
 import warnings
 warnings.filterwarnings("ignore", message=".*urllib3.*")
 warnings.filterwarnings("ignore", category=DeprecationWarning)
@@ -348,8 +348,8 @@ instances_lock   = threading.RLock()
 user_states      = {}
 states_lock      = threading.RLock()
 user_last_request = defaultdict(float)
-user_latest_range = {}      # store last used range for "Change Number"
-user_latest_provider = {}   # store last used provider
+user_latest_range = {}
+user_latest_provider = {}
 
 # Per‑user active numbers (limit 3)
 user_active_numbers = defaultdict(lambda: deque(maxlen=3))
@@ -730,7 +730,7 @@ def format_balance_message(user_id):
 
 def format_inbox_message(number, provider, full_message, otp):
     t = datetime.now().strftime('%I:%M %p')
-    msg = f"📩 <b>Message Received!</b>\n\n📞 <b>Number:</b> <code>+{number}</code>\n🏢 <b>Provider:</b> <code>{provider.upper()}</code>\n"
+    msg = f"📩 <b>Message Received!</b>\n\n📞 <b>Number:</b> <code>+{number}</code>\n🏢 <b>Provider:</b>\n\n<code>{provider.upper()}</code>\n"
     if otp:
         msg += f"🔑 <b>OTP Code:</b> <code>{otp}</code>\n"
     msg += f"\n💬 <b>Full Message:</b>\n<blockquote>{escape(full_message)}</blockquote>\n\n🕒 <b>Time:</b> {t}"
@@ -817,7 +817,7 @@ def send_to_all_groups(text, keyboard=None):
     for gid in GROUP_IDS:
         tg_send(gid, text, keyboard)
 
-# ---------- Monitoring (only latest 3 numbers per user) ----------
+# ---------- Monitoring (only latest 3 numbers per user, with duplicate protection) ----------
 active_monitors = {}
 
 def monitor_number_loop(chat_id, number, provider_name, range_used, start_time):
@@ -846,7 +846,7 @@ def monitor_number_loop(chat_id, number, provider_name, range_used, start_time):
                 'start': start_time
             }
 
-        last_msg_text = ""
+        last_msg_id = None   # Store last message ID to avoid duplicates
         timeout = TIMEOUT_SECONDS
         failed = False
         custom_email, _ = get_credentials(chat_id, provider_name)
@@ -860,17 +860,21 @@ def monitor_number_loop(chat_id, number, provider_name, range_used, start_time):
                         continue
                     status = n.get('status', '')
                     msg = n.get('message') or n.get('otp') or ''
+                    # Use message ID if available, otherwise hash the message content + timestamp
+                    current_msg_id = n.get('message_id') or n.get('id') or hash((msg, n.get('updated_at', '')))
                     if status == 'failed':
                         failed = True
                         break
-                    if status == 'success' and msg and msg != last_msg_text:
-                        last_msg_text = msg
+                    if status == 'success' and msg and current_msg_id != last_msg_id:
+                        last_msg_id = current_msg_id
                         otp = bot.extract_otp(msg)
                         tg_send(chat_id, format_inbox_message(number, provider_name, msg, otp), otp_received_keyboard() if otp else None)
                         if otp and GROUP_IDS:
                             send_to_all_groups(format_group_message(number, provider_name, msg, otp), group_message_keyboard())
                         if using_default:
                             credit_user(chat_id, 0.30)
+                        # Small delay to avoid duplicate in same batch if API returns same item again
+                        time.sleep(1)
                 if failed:
                     break
             except Exception as e:
@@ -878,11 +882,11 @@ def monitor_number_loop(chat_id, number, provider_name, range_used, start_time):
 
             elapsed = time.time() - start_time
             if elapsed < 15:
-                sleep_time = 1.0
-            elif elapsed < 45:
                 sleep_time = 1.5
-            elif elapsed < 90:
+            elif elapsed < 45:
                 sleep_time = 2.0
+            elif elapsed < 90:
+                sleep_time = 2.5
             else:
                 sleep_time = 3.0
             if cancel_evt.wait(sleep_time):
@@ -942,8 +946,10 @@ def handle_create_number(provider, chat_id, manual_range):
         msg = (
             f"✅ <b>Number Ready!</b>\n"
             f"━━━━━━━━━━━━━━━━\n"
-            f"📞 <b>Number:</b> <code>+{number}</code>\n"
             f"🏢 <b>Provider:</b> <code>{provider_display}</code>\n"
+            
+            f"📞 <b>Number:</b> <code>+{number}</code>\n"
+            
             f"━━━━━━━━━━━━━━━━\n"
             f"⏳ <b>Waiting for OTP...</b>"
         )
@@ -958,7 +964,7 @@ def handle_create_number(provider, chat_id, manual_range):
         else:
             tg_send(chat_id, f"❌ Error: {escape(error_msg)}", main_keyboard(chat_id))
 
-# ---------- Login flow ----------
+# ---------- Login flow (unchanged) ----------
 def start_login(chat_id):
     with states_lock:
         user_states[chat_id] = {'step': 'awaiting_login_provider'}
@@ -1017,7 +1023,7 @@ def handle_logout(chat_id):
     logout_user(chat_id)
     tg_send(chat_id, "🔓 <b>Logged out.</b> Using default accounts.", main_keyboard(chat_id))
 
-# ---------- TempMail background ----------
+# ---------- TempMail background (unchanged) ----------
 def temp_inbox_watcher():
     while True:
         with temp_email_lock:
@@ -1119,7 +1125,6 @@ def run_telegram_bot():
                     except Exception:
                         pass
 
-                    # All copy callbacks have been removed – only handle wallet/withdrawal/admin
                     if data == 'profile_set_wallet':
                         tg_send(chat_id, "🔧 <b>Select wallet to set:</b>", wallet_method_keyboard())
                     elif data.startswith('wallet_'):
