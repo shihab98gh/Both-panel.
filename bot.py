@@ -730,7 +730,7 @@ def format_balance_message(user_id):
 
 def format_inbox_message(number, provider, full_message, otp):
     t = datetime.now().strftime('%I:%M %p')
-    msg = f"📩 <b>Message Received!</b>\n\n📞 <b>Number:</b> <code>+{number}</code>\n🏢 <b>Provider:</b>\n\n<code>{provider.upper()}</code>\n"
+    msg = f"📩 <b>Message Received!</b>\n\n📞 <b>Number:</b> <code>+{number}</code>\n🏢 <b>Provider:</b><code>{provider.upper()}</code>\n\n"
     if otp:
         msg += f"🔑 <b>OTP Code:</b> <code>{otp}</code>\n"
     msg += f"\n💬 <b>Full Message:</b>\n<blockquote>{escape(full_message)}</blockquote>\n\n🕒 <b>Time:</b> {t}"
@@ -750,7 +750,7 @@ This number can't receive SMS. Try again.
 def format_group_message(number, provider, full_message, otp):
     t = datetime.now().strftime('%I:%M %p')
     masked = f"{number[:3]}****{number[-3:]}" if len(number) > 6 else 'Unknown'
-    msg = f"✅ <b>New message received!</b>\n\n📞 <b>Number:</b> <code>+{masked}</code>\n🏢 <b>Provider:</b> <code>{provider.upper()}</code>\n"
+    msg = f"✅ <b>New message received!</b>\n\n📞 <b>Number:</b> <code>+{masked}</code>\n🏢 <b>Provider:</b> <code>{provider.upper()}</code>\n\n"
     if otp:
         msg += f"🔑 <b>OTP:</b> <code>{otp}</code>\n"
     msg += f"\n💬 <b>Message:</b>\n<blockquote>{escape(full_message)}</blockquote>\n\n🕒 <b>Time:</b> {t}"
