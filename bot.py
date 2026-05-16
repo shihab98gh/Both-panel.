@@ -703,7 +703,7 @@ def otp_received_keyboard():
 def group_message_keyboard():
     if not BOT_USERNAME:
         return None
-    return {'inline_keyboard': [[{'text': '🚀 Get Number', 'url': f'https://t.me/{BOT_USERNAME}?start=getnumber'}]]}
+    return {'inline_keyboard': [[{'text': '🚀 Get Number', 'url': f'https://t.me/orbitsms_bot?start=orbitsms_bot'}]]}
 
 # ---------- Message formatters ----------
 def format_balance_message(user_id):
